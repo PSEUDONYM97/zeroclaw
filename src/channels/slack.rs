@@ -58,12 +58,19 @@ impl Channel for SlackChannel {
             "text": message
         });
 
-        self.client
+        let resp = self
+            .client
             .post("https://slack.com/api/chat.postMessage")
             .bearer_auth(&self.bot_token)
             .json(&body)
             .send()
             .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Slack chat.postMessage failed ({status}): {err}");
+        }
 
         Ok(())
     }
