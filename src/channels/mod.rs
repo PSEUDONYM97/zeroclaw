@@ -23,9 +23,14 @@ pub use whatsapp::WhatsAppChannel;
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
-use crate::providers::{self, Provider};
+use crate::observability::{self, Observer};
+use crate::providers::{self, ChatMessage, Provider};
+use crate::runtime;
+use crate::security::SecurityPolicy;
+use crate::tools;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -501,6 +506,28 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let workspace = config.workspace_dir.clone();
     let skills = crate::skills::load_skills(&workspace);
 
+    // ── Wire up tools, security, runtime (same as CLI agent) ──
+    let observer: Arc<dyn Observer> =
+        Arc::from(observability::create_observer(&config.observability));
+    let runtime_adapter: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let composio_key = if config.composio.enabled {
+        config.composio.api_key.as_deref()
+    } else {
+        None
+    };
+    let tools_registry = tools::all_tools_with_runtime(
+        &security,
+        runtime_adapter,
+        mem.clone(),
+        composio_key,
+        &config.browser,
+    );
+
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
@@ -536,13 +563,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ));
     }
 
-    let system_prompt = build_system_prompt(
+    let mut system_prompt = build_system_prompt(
         &workspace,
         &model,
         &tool_descs,
         &skills,
         Some(&config.identity),
     );
+
+    // Append structured tool-use instructions with schemas (same as CLI agent)
+    system_prompt.push_str(&crate::agent::build_tool_instructions(&tools_registry));
 
     if !skills.is_empty() {
         println!(
@@ -672,7 +702,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
     drop(tx); // Drop our copy so rx closes when all channels stop
 
-    // Process incoming messages — call the LLM and reply
+    // Per-sender conversation histories for multi-turn support
+    let mut histories: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+
+    // Process incoming messages — run through the agent loop (with tools)
     while let Some(msg) = rx.recv().await {
         println!(
             "  💬 [{}] from {}: {}",
@@ -692,18 +725,43 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 .await;
         }
 
-        // Call the LLM with system prompt (identity + soul + tools)
+        // Get or create conversation history for this sender
+        let sender_key = format!("{}:{}", msg.channel, msg.sender);
+        let history = histories
+            .entry(sender_key)
+            .or_insert_with(|| vec![ChatMessage::system(&system_prompt)]);
+
+        // Inject memory context into user message
+        let context = crate::agent::build_context(mem.as_ref(), &msg.content).await;
+        let enriched = if context.is_empty() {
+            msg.content.clone()
+        } else {
+            format!("{context}{}", msg.content)
+        };
+
+        history.push(ChatMessage::user(&enriched));
+
         println!("  ⏳ Processing message...");
         let started_at = Instant::now();
 
         let llm_result = tokio::time::timeout(
             Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
-            provider.chat_with_system(Some(&system_prompt), &msg.content, &model, temperature),
+            crate::agent::agent_turn(
+                provider.as_ref(),
+                history,
+                &tools_registry,
+                observer.as_ref(),
+                &model,
+                temperature,
+            ),
         )
         .await;
 
         match llm_result {
             Ok(Ok(response)) => {
+                // Trim history to prevent unbounded growth
+                crate::agent::trim_history(history);
+
                 println!(
                     "  🤖 Reply ({}ms): {}",
                     started_at.elapsed().as_millis(),
@@ -717,6 +775,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
                         }
                         break;
                     }
+                }
+
+                // Auto-save assistant response
+                if config.memory.auto_save {
+                    let summary = truncate_with_ellipsis(&response, 100);
+                    let _ = mem
+                        .store(
+                            "assistant_resp",
+                            &summary,
+                            crate::memory::MemoryCategory::Daily,
+                        )
+                        .await;
                 }
             }
             Ok(Err(e)) => {

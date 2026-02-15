@@ -1,4 +1,4 @@
-use crate::providers::traits::Provider;
+use crate::providers::traits::{ChatMessage, Provider};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -111,6 +111,78 @@ impl Provider for AnthropicProvider {
                 .header("anthropic-dangerous-direct-browser-access", "true");
         } else {
             // Regular API keys use x-api-key header.
+            request = request.header("x-api-key", credential);
+        }
+
+        let response = request.send().await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("Anthropic", response).await);
+        }
+
+        let chat_response: ChatResponse = response.json().await?;
+
+        chat_response
+            .content
+            .into_iter()
+            .next()
+            .map(|c| c.text)
+            .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+            )
+        })?;
+
+        // Extract system prompt (first system message) and non-system messages
+        let system_prompt = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.clone());
+
+        let api_messages: Vec<Message> = messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+
+        let request_body = ChatRequest {
+            model: model.to_string(),
+            max_tokens: 4096,
+            system: system_prompt,
+            messages: api_messages,
+            temperature,
+        };
+
+        let mut request = self
+            .client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request_body);
+
+        if Self::is_oauth_token(credential) {
+            request = request
+                .header("Authorization", format!("Bearer {credential}"))
+                .header(
+                    "anthropic-beta",
+                    "claude-code-20250219,oauth-2025-04-20",
+                )
+                .header("user-agent", "claude-cli/2.1.2 (external, cli)")
+                .header("x-app", "cli")
+                .header("anthropic-dangerous-direct-browser-access", "true");
+        } else {
             request = request.header("x-api-key", credential);
         }
 

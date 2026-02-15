@@ -21,7 +21,7 @@ const MAX_HISTORY_MESSAGES: usize = 50;
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
-fn trim_history(history: &mut Vec<ChatMessage>) {
+pub fn trim_history(history: &mut Vec<ChatMessage>) {
     // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -40,7 +40,7 @@ fn trim_history(history: &mut Vec<ChatMessage>) {
 }
 
 /// Build context preamble by searching memory for relevant entries
-async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
+pub async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
     let mut context = String::new();
 
     // Pull relevant memories for this message
@@ -58,7 +58,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
 }
 
 /// Find a tool by name in the registry.
-fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
+pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
@@ -72,7 +72,7 @@ fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool>
 /// ```
 ///
 /// Also supports JSON with `tool_calls` array from OpenAI-format responses.
-fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
+pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut text_parts = Vec::new();
     let mut calls = Vec::new();
     let mut remaining = response;
@@ -118,14 +118,14 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 }
 
 #[derive(Debug)]
-struct ParsedToolCall {
-    name: String,
-    arguments: serde_json::Value,
+pub struct ParsedToolCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
 }
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
-async fn agent_turn(
+pub async fn agent_turn(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
@@ -206,7 +206,7 @@ async fn agent_turn(
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
