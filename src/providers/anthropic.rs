@@ -59,8 +59,8 @@ impl AnthropicProvider {
         }
     }
 
-    fn is_setup_token(token: &str) -> bool {
-        token.starts_with("sk-ant-oat01-")
+    fn is_oauth_token(token: &str) -> bool {
+        token.contains("sk-ant-oat")
     }
 }
 
@@ -97,9 +97,20 @@ impl Provider for AnthropicProvider {
             .header("content-type", "application/json")
             .json(&request);
 
-        if Self::is_setup_token(credential) {
-            request = request.header("Authorization", format!("Bearer {credential}"));
+        if Self::is_oauth_token(credential) {
+            // OAuth/setup tokens (sk-ant-oat*) require Bearer auth plus beta flags.
+            // The oauth-2025-04-20 beta flag is required for the API to accept OAuth tokens.
+            request = request
+                .header("Authorization", format!("Bearer {credential}"))
+                .header(
+                    "anthropic-beta",
+                    "claude-code-20250219,oauth-2025-04-20",
+                )
+                .header("user-agent", "claude-cli/2.1.2 (external, cli)")
+                .header("x-app", "cli")
+                .header("anthropic-dangerous-direct-browser-access", "true");
         } else {
+            // Regular API keys use x-api-key header.
             request = request.header("x-api-key", credential);
         }
 
@@ -187,9 +198,9 @@ mod tests {
     }
 
     #[test]
-    fn setup_token_detection_works() {
-        assert!(AnthropicProvider::is_setup_token("sk-ant-oat01-abcdef"));
-        assert!(!AnthropicProvider::is_setup_token("sk-ant-api-key"));
+    fn oauth_token_detection_works() {
+        assert!(AnthropicProvider::is_oauth_token("sk-ant-oat01-abcdef"));
+        assert!(!AnthropicProvider::is_oauth_token("sk-ant-api03-key"));
     }
 
     #[tokio::test]
