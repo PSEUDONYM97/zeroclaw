@@ -148,23 +148,23 @@ enum Commands {
     /// Start the gateway server (webhooks, websockets)
     Gateway {
         /// Port to listen on (use 0 for random available port)
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        #[arg(long)]
+        host: Option<String>,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
     Daemon {
         /// Port to listen on (use 0 for random available port)
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        #[arg(long)]
+        host: Option<String>,
     },
 
     /// Manage OS service lifecycle (launchd/systemd user service)
@@ -406,6 +406,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Gateway { port, host } => {
+            let (host, port) = resolve_gateway_bind(&config, host, port);
             if port == 0 {
                 info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
             } else {
@@ -415,6 +416,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Daemon { port, host } => {
+            let (host, port) = resolve_gateway_bind(&config, host, port);
             if port == 0 {
                 info!("🧠 Starting ZeroClaw Daemon on {host} (random port)");
             } else {
@@ -543,6 +545,12 @@ async fn main() -> Result<()> {
     }
 }
 
+fn resolve_gateway_bind(config: &Config, host: Option<String>, port: Option<u16>) -> (String, u16) {
+    let resolved_host = host.unwrap_or_else(|| config.gateway.host.clone());
+    let resolved_port = port.unwrap_or(config.gateway.port);
+    (resolved_host, resolved_port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,5 +559,27 @@ mod tests {
     #[test]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn resolve_gateway_bind_uses_config_defaults() {
+        let mut config = Config::default();
+        config.gateway.host = "[::]".to_string();
+        config.gateway.port = 3000;
+
+        let (host, port) = resolve_gateway_bind(&config, None, None);
+        assert_eq!(host, "[::]");
+        assert_eq!(port, 3000);
+    }
+
+    #[test]
+    fn resolve_gateway_bind_prefers_cli_overrides() {
+        let mut config = Config::default();
+        config.gateway.host = "127.0.0.1".to_string();
+        config.gateway.port = 8080;
+
+        let (host, port) = resolve_gateway_bind(&config, Some("0.0.0.0".to_string()), Some(9090));
+        assert_eq!(host, "0.0.0.0");
+        assert_eq!(port, 9090);
     }
 }
