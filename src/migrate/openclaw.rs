@@ -90,6 +90,8 @@ struct Binding {
 struct BindingMatch {
     #[serde(default)]
     channel: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -606,7 +608,12 @@ fn resolve_telegram_binding(
                 == Some("telegram")
     })?;
 
-    let account_name = binding.account.as_deref().unwrap_or("default");
+    let account_name = binding
+        .match_
+        .as_ref()
+        .and_then(|m| m.account_id.as_deref())
+        .or(binding.account.as_deref())
+        .unwrap_or("default");
     let channels_section = channels.as_ref()?;
     let telegram = channels_section.telegram.as_ref()?;
     let account = match telegram.accounts.get(account_name) {
