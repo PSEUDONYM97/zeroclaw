@@ -79,9 +79,19 @@ const POST_SPAWN_CHECK_MS: u64 = 300;
 
 // ── Lifecycle lock ──────────────────────────────────────────────
 
+/// Result type for lifecycle lock acquisition that distinguishes
+/// contention from real IO errors.
+pub enum LockOutcome {
+    /// Lock acquired successfully.
+    Acquired(fs::File),
+    /// Lock is held by another process (EWOULDBLOCK).
+    Contended,
+}
+
 /// Acquire per-instance lifecycle lock (non-blocking flock).
-/// Returns the lock file handle (holds lock until dropped).
-pub fn acquire_lifecycle_lock(instance_dir: &Path) -> Result<fs::File> {
+/// Returns `LockOutcome::Acquired(file)` on success, `LockOutcome::Contended`
+/// if another process holds it, or `Err` for real IO/permission errors.
+pub fn try_lifecycle_lock(instance_dir: &Path) -> Result<LockOutcome> {
     let lock_path = instance_dir.join(LIFECYCLE_LOCK);
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -91,10 +101,27 @@ pub fn acquire_lifecycle_lock(instance_dir: &Path) -> Result<fs::File> {
 
     let ret = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if ret != 0 {
-        bail!("Lifecycle lock held (concurrent start/stop in progress?)");
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno == libc::EWOULDBLOCK {
+            return Ok(LockOutcome::Contended);
+        }
+        // Real error (permission, invalid fd, etc.)
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("flock failed on {}", lock_path.display()));
     }
 
-    Ok(lock)
+    Ok(LockOutcome::Acquired(lock))
+}
+
+/// Convenience wrapper: acquire lock or bail with clear error.
+/// Used by lifecycle operations that must hold the lock to proceed.
+pub fn acquire_lifecycle_lock(instance_dir: &Path) -> Result<fs::File> {
+    match try_lifecycle_lock(instance_dir)? {
+        LockOutcome::Acquired(f) => Ok(f),
+        LockOutcome::Contended => {
+            bail!("Lifecycle lock held (concurrent start/stop in progress?)")
+        }
+    }
 }
 
 // ── Instance directory resolution ───────────────────────────────
@@ -426,6 +453,14 @@ fn start_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Res
 
 // ── Public API ─────────────────────────────────────────────────
 
+/// Acquire the lifecycle lock, mapping the outcome to `LifecycleError`.
+fn require_lifecycle_lock(inst_dir: &Path) -> Result<fs::File, LifecycleError> {
+    match try_lifecycle_lock(inst_dir).map_err(LifecycleError::Internal)? {
+        LockOutcome::Acquired(f) => Ok(f),
+        LockOutcome::Contended => Err(LifecycleError::LockHeld),
+    }
+}
+
 /// Start a registered instance by name.
 pub fn start_instance(registry: &Registry, name: &str) -> Result<(), LifecycleError> {
     let instance = registry
@@ -434,13 +469,7 @@ pub fn start_instance(registry: &Registry, name: &str) -> Result<(), LifecycleEr
         .ok_or_else(|| LifecycleError::NotFound(name.to_string()))?;
 
     let inst_dir = instance_dir_from(&instance);
-    let _lock = acquire_lifecycle_lock(&inst_dir).map_err(|e| {
-        if e.to_string().contains("Lifecycle lock held") {
-            LifecycleError::LockHeld
-        } else {
-            LifecycleError::Internal(e)
-        }
-    })?;
+    let _lock = require_lifecycle_lock(&inst_dir)?;
     start_inner(registry, &instance, &inst_dir)
 }
 
@@ -452,13 +481,7 @@ pub fn stop_instance(registry: &Registry, name: &str) -> Result<(), LifecycleErr
         .ok_or_else(|| LifecycleError::NotFound(name.to_string()))?;
 
     let inst_dir = instance_dir_from(&instance);
-    let _lock = acquire_lifecycle_lock(&inst_dir).map_err(|e| {
-        if e.to_string().contains("Lifecycle lock held") {
-            LifecycleError::LockHeld
-        } else {
-            LifecycleError::Internal(e)
-        }
-    })?;
+    let _lock = require_lifecycle_lock(&inst_dir)?;
     stop_inner(registry, &instance, &inst_dir)
 }
 
@@ -471,13 +494,7 @@ pub fn restart_instance(registry: &Registry, name: &str) -> Result<(), Lifecycle
         .ok_or_else(|| LifecycleError::NotFound(name.to_string()))?;
 
     let inst_dir = instance_dir_from(&instance);
-    let _lock = acquire_lifecycle_lock(&inst_dir).map_err(|e| {
-        if e.to_string().contains("Lifecycle lock held") {
-            LifecycleError::LockHeld
-        } else {
-            LifecycleError::Internal(e)
-        }
-    })?;
+    let _lock = require_lifecycle_lock(&inst_dir)?;
 
     // Stop if running
     if let Some(pid) = read_pid(&inst_dir)? {

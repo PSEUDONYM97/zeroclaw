@@ -141,7 +141,7 @@ fn gate2b_drift_detection_stopped_but_alive() -> Result<()> {
 
     // Spawn a real process with ZEROCLAW_HOME pointing to inst_dir.
     // This makes verify_pid_ownership return true, so live_status returns "running".
-    let child = std::process::Command::new("sleep")
+    let mut child = std::process::Command::new("sleep")
         .arg("60")
         .env("ZEROCLAW_HOME", inst_dir.to_str().unwrap())
         .spawn()?;
@@ -167,12 +167,9 @@ fn gate2b_drift_detection_stopped_but_alive() -> Result<()> {
     assert_eq!(inst.pid, Some(child_pid), "DB PID cache should be set");
     drop(registry);
 
-    // Cleanup: kill the child
-    unsafe {
-        libc::kill(child_pid as libc::pid_t, libc::SIGKILL);
-    }
-    // Reap to avoid zombie
-    let _ = std::process::Command::new("wait").arg(child_pid.to_string()).status();
+    // Cleanup: kill the child and reap via the Child handle to avoid zombies
+    child.kill()?;
+    let _ = child.wait();
 
     Ok(())
 }

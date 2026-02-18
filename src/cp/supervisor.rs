@@ -34,12 +34,20 @@ pub fn startup_reconcile(db_path: &Path) {
     for instance in &instances {
         let inst_dir = lifecycle::instance_dir_from(instance);
 
-        // Try to acquire lifecycle lock (non-blocking). Skip if held.
-        let _lock = match lifecycle::acquire_lifecycle_lock(&inst_dir) {
-            Ok(lock) => lock,
-            Err(_) => {
+        // Try to acquire lifecycle lock (non-blocking). Skip if contended,
+        // but log real errors (permission, corruption).
+        let _lock = match lifecycle::try_lifecycle_lock(&inst_dir) {
+            Ok(lifecycle::LockOutcome::Acquired(lock)) => lock,
+            Ok(lifecycle::LockOutcome::Contended) => {
                 tracing::info!(
                     "Supervisor: skipping '{}' (lifecycle lock held)",
+                    instance.name
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Supervisor: failed to open lifecycle lock for '{}': {e:#}",
                     instance.name
                 );
                 continue;
@@ -182,12 +190,19 @@ pub fn check_all_instances(db_path: &Path) {
     for instance in &instances {
         let inst_dir = lifecycle::instance_dir_from(instance);
 
-        // Non-blocking lock; skip if held
-        let _lock = match lifecycle::acquire_lifecycle_lock(&inst_dir) {
-            Ok(lock) => lock,
-            Err(_) => {
+        // Non-blocking lock; skip if contended, log real errors
+        let _lock = match lifecycle::try_lifecycle_lock(&inst_dir) {
+            Ok(lifecycle::LockOutcome::Acquired(lock)) => lock,
+            Ok(lifecycle::LockOutcome::Contended) => {
                 tracing::debug!(
                     "Supervisor: skipping '{}' (lifecycle lock held)",
+                    instance.name
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Supervisor: failed to open lifecycle lock for '{}': {e:#}",
                     instance.name
                 );
                 continue;
