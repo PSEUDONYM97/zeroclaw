@@ -23,6 +23,9 @@ use crate::lifecycle::LifecycleError;
 /// Bounds memory usage regardless of total file size.
 const MAX_TAIL_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
 
+/// Embedded SPA HTML served at `/` and as a fallback for non-API paths.
+const INDEX_HTML: &str = include_str!("../../static/index.html");
+
 /// Read the last `n` lines from a file without loading the entire file.
 /// Reads at most `MAX_TAIL_BYTES` from the end of the file.
 fn read_last_n_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
@@ -94,32 +97,49 @@ pub struct CpState {
     pub db_path: Arc<PathBuf>,
 }
 
-/// Build the axum router with all CP API routes.
+/// Serve the embedded SPA HTML.
+async fn handle_ui() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(INDEX_HTML))
+        .unwrap()
+}
+
+/// JSON 404 for unknown API paths. Keeps API errors as JSON, never HTML.
+async fn handle_api_fallback() -> ApiResponse {
+    err_json(StatusCode::NOT_FOUND, "Unknown API endpoint")
+}
+
+/// Build the axum router with all CP API routes and embedded UI.
 pub fn build_router(state: CpState) -> Router {
-    Router::new()
-        .route("/api/health", get(handle_health))
-        .route("/api/instances", get(handle_list_instances))
-        .route("/api/instances/:name", get(handle_get_instance))
-        .route("/api/instances/:name/start", post(handle_start))
-        .route("/api/instances/:name/stop", post(handle_stop))
-        .route("/api/instances/:name/restart", post(handle_restart))
-        .route("/api/instances/:name/logs", get(handle_logs))
-        .route("/api/instances/:name/details", get(handle_details))
-        .route("/api/instances/:name/tasks", get(handle_tasks))
-        .route("/api/instances/:name/usage", get(handle_usage))
+    let api_router = Router::new()
+        .route("/health", get(handle_health))
+        .route("/instances", get(handle_list_instances))
+        .route("/instances/:name", get(handle_get_instance))
+        .route("/instances/:name/start", post(handle_start))
+        .route("/instances/:name/stop", post(handle_stop))
+        .route("/instances/:name/restart", post(handle_restart))
+        .route("/instances/:name/logs", get(handle_logs))
+        .route("/instances/:name/details", get(handle_details))
+        .route("/instances/:name/tasks", get(handle_tasks))
+        .route("/instances/:name/usage", get(handle_usage))
+        .route("/instances/:name/logs/download", get(handle_logs_download))
         .route(
-            "/api/instances/:name/logs/download",
-            get(handle_logs_download),
-        )
-        .route(
-            "/api/instances/:name/config",
+            "/instances/:name/config",
             get(handle_config_get).put(handle_config_put),
         )
         .route(
-            "/api/instances/:name/config/validate",
+            "/instances/:name/config/validate",
             post(handle_config_validate),
         )
-        .route("/api/instances/:name/config/diff", post(handle_config_diff))
+        .route("/instances/:name/config/diff", post(handle_config_diff))
+        .fallback(handle_api_fallback);
+
+    Router::new()
+        .route("/", get(handle_ui))
+        .nest("/api", api_router)
+        .fallback(handle_ui)
         .with_state(state)
 }
 

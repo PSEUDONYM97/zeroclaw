@@ -1,0 +1,1066 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZeroClaw Command Center</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --bg-card: #161822;
+  --bg-input: #1c1f2e;
+  --border: #2a2d3e;
+  --text: #e1e4ed;
+  --text-dim: #8b8fa3;
+  --green: #3dd68c;
+  --red: #f5555d;
+  --yellow: #e5c07b;
+  --orange: #d19a66;
+  --blue: #61afef;
+  --purple: #c678dd;
+  --radius: 6px;
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  --mono: 'SF Mono', 'Cascadia Code', 'Consolas', 'Liberation Mono', monospace;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+}
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Layout */
+.header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
+}
+.header h1 { font-size: 16px; font-weight: 600; }
+.header h1 span { color: var(--green); }
+.header-right { font-size: 13px; color: var(--text-dim); }
+.main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+/* Cards grid */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 16px;
+}
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.card:hover { border-color: var(--text-dim); }
+.card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.card-name { font-size: 15px; font-weight: 600; }
+.card-meta { font-size: 13px; color: var(--text-dim); margin-top: 8px; }
+.card-meta span { margin-right: 16px; }
+
+/* Status badge */
+.status {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.status::before {
+  content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+}
+.status-running { color: var(--green); }
+.status-running::before { background: var(--green); }
+.status-stopped { color: var(--red); }
+.status-stopped::before { background: var(--red); }
+.status-stale-pid { color: var(--yellow); }
+.status-stale-pid::before { background: var(--yellow); }
+.status-dead { color: var(--orange); }
+.status-dead::before { background: var(--orange); }
+.status-unknown { color: var(--text-dim); }
+.status-unknown::before { background: var(--text-dim); }
+
+/* Buttons */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 14px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-input);
+  color: var(--text); font-size: 13px; font-family: var(--font);
+  cursor: pointer; transition: background 0.15s, border-color 0.15s;
+}
+.btn:hover { border-color: var(--text-dim); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-start { border-color: var(--green); color: var(--green); }
+.btn-start:hover { background: rgba(61,214,140,0.1); }
+.btn-stop { border-color: var(--red); color: var(--red); }
+.btn-stop:hover { background: rgba(245,85,93,0.1); }
+.btn-restart { border-color: var(--yellow); color: var(--yellow); }
+.btn-restart:hover { background: rgba(229,192,123,0.1); }
+.btn-primary { border-color: var(--blue); color: var(--blue); }
+.btn-primary:hover { background: rgba(97,175,239,0.1); }
+.btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* Instance detail layout */
+.instance-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 20px; flex-wrap: wrap; gap: 12px;
+}
+.instance-title { display: flex; align-items: center; gap: 12px; }
+.instance-title h2 { font-size: 20px; font-weight: 600; }
+.back-link { font-size: 13px; color: var(--text-dim); }
+
+/* Tabs */
+.tabs {
+  display: flex; gap: 0; border-bottom: 1px solid var(--border);
+  margin-bottom: 20px;
+}
+.tab {
+  padding: 8px 16px; font-size: 13px; color: var(--text-dim);
+  cursor: pointer; border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+  background: none; border-top: none; border-left: none; border-right: none;
+  font-family: var(--font);
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+
+/* Panels */
+.panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+.panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 16px;
+}
+.panel-title { font-size: 14px; font-weight: 600; }
+
+/* Detail rows */
+.detail-grid {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 8px 16px;
+  font-size: 14px;
+}
+.detail-label { color: var(--text-dim); }
+.detail-value { font-family: var(--mono); font-size: 13px; }
+
+/* Log viewer */
+.log-viewer {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  max-height: 600px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-dim);
+}
+
+/* Config editor */
+.config-editor {
+  width: 100%;
+  min-height: 400px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text);
+  resize: vertical;
+}
+.config-editor:focus { outline: 1px solid var(--blue); border-color: var(--blue); }
+
+/* Notifications */
+.notify {
+  padding: 10px 16px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.notify-success { background: rgba(61,214,140,0.1); border: 1px solid var(--green); color: var(--green); }
+.notify-error { background: rgba(245,85,93,0.1); border: 1px solid var(--red); color: var(--red); }
+.notify-warn { background: rgba(229,192,123,0.1); border: 1px solid var(--yellow); color: var(--yellow); }
+.notify-info { background: rgba(97,175,239,0.1); border: 1px solid var(--blue); color: var(--blue); }
+
+/* Diff panel */
+.diff-panel {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  margin-top: 12px;
+}
+.diff-change { color: var(--yellow); }
+.diff-add { color: var(--green); }
+.diff-remove { color: var(--red); }
+
+/* Table */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.data-table th {
+  text-align: left; padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim); font-weight: 500;
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.data-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.data-table tr:last-child td { border-bottom: none; }
+
+/* Usage stats */
+.usage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 16px;
+}
+.usage-stat {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+.usage-stat-label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+.usage-stat-value { font-size: 24px; font-weight: 600; margin-top: 4px; font-family: var(--mono); }
+
+/* Loading */
+.loading { color: var(--text-dim); font-size: 14px; padding: 20px 0; }
+.empty-state { color: var(--text-dim); font-size: 14px; padding: 40px 0; text-align: center; }
+
+/* Conflict dialog */
+.conflict-dialog {
+  background: var(--bg-card);
+  border: 2px solid var(--yellow);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-top: 12px;
+}
+.conflict-dialog h3 { color: var(--yellow); font-size: 14px; margin-bottom: 8px; }
+.conflict-dialog p { font-size: 13px; color: var(--text-dim); margin-bottom: 12px; }
+
+/* Window select */
+.window-select {
+  display: flex; gap: 4px;
+}
+.window-btn {
+  padding: 4px 12px; font-size: 12px;
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text-dim);
+  cursor: pointer; font-family: var(--font);
+}
+.window-btn.active { border-color: var(--blue); color: var(--blue); }
+
+/* Pagination */
+.pagination {
+  display: flex; align-items: center; gap: 12px;
+  margin-top: 12px; font-size: 13px; color: var(--text-dim);
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span>Zero</span>Claw <span style="color:var(--text-dim);font-weight:400;font-size:13px;">Command Center</span></h1>
+  <div class="header-right" id="health-status"></div>
+</div>
+<div class="main" id="app"></div>
+
+<script>
+'use strict';
+
+// ── State ────────────────────────────────────────────────────────
+const state = {
+  view: 'dashboard',
+  instance: null,
+  tab: 'overview',
+  instances: [],
+  refreshTimer: null,
+  abortController: null,
+  configEtag: null,
+  routeGeneration: 0,
+};
+
+// ── DOM helpers (XSS-safe) ───────────────────────────────────────
+function h(tag, attrs) {
+  const el = document.createElement(tag);
+  if (attrs) {
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === 'className') el.className = v;
+      else if (k === 'textContent') el.textContent = v;
+      else if (k.startsWith('on')) el.addEventListener(k.slice(2).toLowerCase(), v);
+      else el.setAttribute(k, v);
+    }
+  }
+  for (let i = 2; i < arguments.length; i++) {
+    const child = arguments[i];
+    if (child == null) continue;
+    if (typeof child === 'string') el.appendChild(document.createTextNode(child));
+    else if (child instanceof Node) el.appendChild(child);
+  }
+  return el;
+}
+
+function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+
+function statusClass(s) {
+  if (s === 'running') return 'status-running';
+  if (s === 'stopped') return 'status-stopped';
+  if (s === 'stale-pid') return 'status-stale-pid';
+  if (s === 'dead') return 'status-dead';
+  return 'status-unknown';
+}
+
+function fmtNum(n) {
+  if (n == null) return '-';
+  return n.toLocaleString();
+}
+
+function fmtDuration(ms) {
+  if (ms == null) return '-';
+  if (ms < 1000) return ms + 'ms';
+  return (ms / 1000).toFixed(1) + 's';
+}
+
+function fmtTime(ts) {
+  if (!ts) return '-';
+  try {
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return ts;
+    return d.toLocaleString();
+  } catch (e) { return ts; }
+}
+
+// ── Notifications ────────────────────────────────────────────────
+function showNotify(container, type, msg) {
+  const existing = container.querySelector('.notify');
+  if (existing) existing.remove();
+  const n = h('div', { className: 'notify notify-' + type, textContent: msg });
+  container.insertBefore(n, container.firstChild);
+  if (type === 'success' || type === 'info') {
+    setTimeout(function() { if (n.parentNode) n.remove(); }, 4000);
+  }
+}
+
+// ── API wrapper ──────────────────────────────────────────────────
+async function api(path, opts) {
+  opts = opts || {};
+  const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+  const resp = await fetch('/api' + path, {
+    method: opts.method || 'GET',
+    headers: headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    signal: state.abortController ? state.abortController.signal : undefined,
+  });
+  const ct = resp.headers.get('content-type') || '';
+  let data = null;
+  if (ct.includes('application/json')) {
+    data = await resp.json();
+  }
+  return { status: resp.status, data: data, headers: resp.headers };
+}
+
+// ── Router ───────────────────────────────────────────────────────
+function route() {
+  if (state.refreshTimer) { clearInterval(state.refreshTimer); state.refreshTimer = null; }
+  if (state.abortController) { state.abortController.abort(); }
+  state.abortController = new AbortController();
+  state.routeGeneration++;
+  const gen = state.routeGeneration;
+
+  const hash = location.hash || '#/';
+  const parts = hash.replace('#/', '').split('/');
+
+  if (parts[0] === 'instance' && parts[1]) {
+    state.view = 'instance';
+    state.instance = decodeURIComponent(parts[1]);
+    state.tab = parts[2] || 'overview';
+    renderInstance(gen);
+  } else {
+    state.view = 'dashboard';
+    state.instance = null;
+    state.tab = 'overview';
+    renderDashboard(gen);
+  }
+}
+
+window.addEventListener('hashchange', route);
+
+// ── Dashboard ────────────────────────────────────────────────────
+async function renderDashboard(gen) {
+  const app = document.getElementById('app');
+  clear(app);
+  app.appendChild(h('div', { className: 'loading', textContent: 'Loading instances...' }));
+
+  try {
+    const res = await api('/instances');
+    if (gen !== state.routeGeneration) return;
+    if (res.status === 200 && Array.isArray(res.data)) {
+      state.instances = res.data;
+      paintDashboard();
+    } else {
+      clear(app);
+      var msg = (res.data && res.data.error) || ('Server returned ' + res.status);
+      app.appendChild(h('div', { className: 'notify notify-error', textContent: 'Failed to load instances: ' + msg }));
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    clear(app);
+    app.appendChild(h('div', { className: 'notify notify-error', textContent: 'Failed to load instances: ' + e.message }));
+  }
+
+  state.refreshTimer = setInterval(async function() {
+    try {
+      const res = await api('/instances');
+      if (gen !== state.routeGeneration) return;
+      if (res.status === 200 && Array.isArray(res.data)) {
+        state.instances = res.data;
+        paintDashboard();
+      }
+      // On refresh errors, retain the last good state rather than clobbering the UI
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+    }
+  }, 5000);
+}
+
+function paintDashboard() {
+  const app = document.getElementById('app');
+  clear(app);
+
+  if (state.instances.length === 0) {
+    app.appendChild(h('div', { className: 'empty-state', textContent: 'No instances registered. Use the CLI to create one.' }));
+    return;
+  }
+
+  const grid = h('div', { className: 'cards' });
+  for (const inst of state.instances) {
+    const card = h('div', { className: 'card', onClick: function() { location.hash = '#/instance/' + encodeURIComponent(inst.name); } },
+      h('div', { className: 'card-header' },
+        h('span', { className: 'card-name', textContent: inst.name }),
+        h('span', { className: 'status ' + statusClass(inst.status), textContent: inst.status })
+      ),
+      h('div', { className: 'card-meta' },
+        h('span', { textContent: 'Port: ' + (inst.port || '-') }),
+        inst.pid ? h('span', { textContent: 'PID: ' + inst.pid }) : null
+      )
+    );
+    grid.appendChild(card);
+  }
+  app.appendChild(grid);
+}
+
+// ── Instance detail ──────────────────────────────────────────────
+function renderInstance(gen) {
+  const app = document.getElementById('app');
+  clear(app);
+
+  // Header
+  const header = h('div', { className: 'instance-header' },
+    h('div', { className: 'instance-title' },
+      h('a', { className: 'back-link', href: '#/', textContent: 'Instances' }),
+      h('span', { textContent: ' / ', style: 'color:var(--text-dim)' }),
+      h('h2', { textContent: state.instance })
+    ),
+    h('div', { className: 'btn-group', id: 'action-btns' })
+  );
+  app.appendChild(header);
+
+  // Tabs
+  var tabs = ['overview', 'logs', 'config', 'events', 'usage'];
+  var tabBar = h('div', { className: 'tabs' });
+  for (var i = 0; i < tabs.length; i++) {
+    (function(t) {
+      var btn = h('button', {
+        className: 'tab' + (state.tab === t ? ' active' : ''),
+        textContent: t.charAt(0).toUpperCase() + t.slice(1),
+        onClick: function() { location.hash = '#/instance/' + encodeURIComponent(state.instance) + '/' + t; }
+      });
+      tabBar.appendChild(btn);
+    })(tabs[i]);
+  }
+  app.appendChild(tabBar);
+
+  // Content container
+  var content = h('div', { id: 'tab-content' });
+  app.appendChild(content);
+
+  // Render selected tab
+  if (state.tab === 'overview') renderOverview(gen);
+  else if (state.tab === 'logs') renderLogs(gen);
+  else if (state.tab === 'config') renderConfig(gen);
+  else if (state.tab === 'events') renderEvents(gen);
+  else if (state.tab === 'usage') renderUsage(gen);
+}
+
+// ── Overview tab ─────────────────────────────────────────────────
+async function renderOverview(gen) {
+  var content = document.getElementById('tab-content');
+  clear(content);
+  content.appendChild(h('div', { className: 'loading', textContent: 'Loading details...' }));
+
+  try {
+    var res = await api('/instances/' + encodeURIComponent(state.instance) + '/details');
+    if (gen !== state.routeGeneration) return;
+    if (res.status !== 200) {
+      clear(content);
+      content.appendChild(h('div', { className: 'notify notify-error', textContent: (res.data && res.data.error) || 'Failed to load details' }));
+      return;
+    }
+    paintOverview(res.data);
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    clear(content);
+    content.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+  }
+}
+
+function paintOverview(data) {
+  var content = document.getElementById('tab-content');
+  clear(content);
+
+  var inst = data.instance || {};
+
+  // Action buttons
+  var btns = document.getElementById('action-btns');
+  if (btns) {
+    clear(btns);
+    btns.appendChild(makeActionBtn('Start', 'btn-start', '/instances/' + encodeURIComponent(inst.name) + '/start', 'POST'));
+    btns.appendChild(makeActionBtn('Stop', 'btn-stop', '/instances/' + encodeURIComponent(inst.name) + '/stop', 'POST'));
+    btns.appendChild(makeActionBtn('Restart', 'btn-restart', '/instances/' + encodeURIComponent(inst.name) + '/restart', 'POST'));
+  }
+
+  // Instance info panel
+  var panel = h('div', { className: 'panel' },
+    h('div', { className: 'panel-header' },
+      h('span', { className: 'panel-title', textContent: 'Instance Details' }),
+      h('span', { className: 'status ' + statusClass(inst.status), textContent: inst.status || 'unknown' })
+    ),
+    h('div', { className: 'detail-grid' },
+      h('span', { className: 'detail-label', textContent: 'Name' }),
+      h('span', { className: 'detail-value', textContent: inst.name || '-' }),
+      h('span', { className: 'detail-label', textContent: 'ID' }),
+      h('span', { className: 'detail-value', textContent: inst.id || '-' }),
+      h('span', { className: 'detail-label', textContent: 'Port' }),
+      h('span', { className: 'detail-value', textContent: String(inst.port || '-') }),
+      h('span', { className: 'detail-label', textContent: 'PID' }),
+      h('span', { className: 'detail-value', textContent: inst.pid ? String(inst.pid) : 'None' }),
+      h('span', { className: 'detail-label', textContent: 'Status' }),
+      h('span', { className: 'detail-value', textContent: inst.status || 'unknown' })
+    )
+  );
+  content.appendChild(panel);
+
+  // Model info
+  if (data.model) {
+    var modelPanel = h('div', { className: 'panel', style: 'margin-top:16px' },
+      h('div', { className: 'panel-title', textContent: 'Model Configuration', style: 'margin-bottom:12px' }),
+      h('div', { className: 'detail-grid' },
+        h('span', { className: 'detail-label', textContent: 'Provider' }),
+        h('span', { className: 'detail-value', textContent: data.model.provider || 'unknown' }),
+        h('span', { className: 'detail-label', textContent: 'Model' }),
+        h('span', { className: 'detail-value', textContent: data.model.model || 'unknown' }),
+        h('span', { className: 'detail-label', textContent: 'Routes' }),
+        h('span', { className: 'detail-value', textContent: String(data.model.routes_count || 0) })
+      )
+    );
+    content.appendChild(modelPanel);
+  }
+
+  // Runtime info
+  if (data.runtime) {
+    var runtimePanel = h('div', { className: 'panel', style: 'margin-top:16px' },
+      h('div', { className: 'panel-title', textContent: 'Runtime', style: 'margin-bottom:12px' }),
+      h('div', { className: 'detail-grid' },
+        h('span', { className: 'detail-label', textContent: 'Kind' }),
+        h('span', { className: 'detail-value', textContent: data.runtime.kind || 'unknown' }),
+        h('span', { className: 'detail-label', textContent: 'Docker Image' }),
+        h('span', { className: 'detail-value', textContent: data.runtime.docker_image || 'None' })
+      )
+    );
+    content.appendChild(runtimePanel);
+  }
+
+  // Channels
+  if (data.channels) {
+    var chPanel = h('div', { className: 'panel', style: 'margin-top:16px' },
+      h('div', { className: 'panel-title', textContent: 'Channels', style: 'margin-bottom:12px' })
+    );
+    var chGrid = h('div', { className: 'detail-grid' });
+    for (var key of Object.keys(data.channels)) {
+      var val = data.channels[key];
+      var display = typeof val === 'boolean' ? (val ? 'Enabled' : 'Disabled') : (val && val.configured ? 'Configured' : String(val));
+      chGrid.appendChild(h('span', { className: 'detail-label', textContent: key }));
+      chGrid.appendChild(h('span', { className: 'detail-value', textContent: display }));
+    }
+    chPanel.appendChild(chGrid);
+    content.appendChild(chPanel);
+  }
+}
+
+function makeActionBtn(label, cls, path, method) {
+  var btn = h('button', { className: 'btn ' + cls, textContent: label });
+  btn.addEventListener('click', async function() {
+    btn.disabled = true;
+    btn.textContent = label + '...';
+    try {
+      var res = await api(path, { method: method });
+      if (res.status === 200) {
+        btn.textContent = label;
+        btn.disabled = false;
+        route(); // refresh
+      } else {
+        btn.textContent = label;
+        btn.disabled = false;
+        var msg = (res.data && res.data.error) || 'Action failed';
+        var content = document.getElementById('tab-content');
+        if (content) showNotify(content, 'error', msg);
+      }
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      btn.textContent = label;
+      btn.disabled = false;
+    }
+  });
+  return btn;
+}
+
+// ── Logs tab ─────────────────────────────────────────────────────
+async function renderLogs(gen) {
+  var content = document.getElementById('tab-content');
+  clear(content);
+
+  var panel = h('div', { className: 'panel' });
+  var header = h('div', { className: 'panel-header' },
+    h('span', { className: 'panel-title', textContent: 'Logs (last 100 lines)' }),
+    h('div', { className: 'btn-group' },
+      h('a', {
+        className: 'btn',
+        href: '/api/instances/' + encodeURIComponent(state.instance) + '/logs/download',
+        target: '_blank',
+        textContent: 'Download'
+      })
+    )
+  );
+  panel.appendChild(header);
+
+  var viewer = h('pre', { className: 'log-viewer', id: 'log-viewer', textContent: 'Loading logs...' });
+  panel.appendChild(viewer);
+  content.appendChild(panel);
+
+  async function fetchLogs() {
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/logs?lines=100&mode=tail');
+      if (gen !== state.routeGeneration) return;
+      var lv = document.getElementById('log-viewer');
+      if (!lv) return;
+      if (res.status !== 200) {
+        var errMsg = (res.data && res.data.error) || ('Failed to fetch logs (HTTP ' + res.status + ')');
+        lv.textContent = 'Error: ' + errMsg;
+        return;
+      }
+      var lines = (res.data && res.data.lines) || [];
+      if (lines.length === 0) {
+        lv.textContent = 'No log output yet.';
+      } else {
+        var wasAtBottom = lv.scrollHeight - lv.scrollTop - lv.clientHeight < 50;
+        lv.textContent = lines.join('\n');
+        if (wasAtBottom) lv.scrollTop = lv.scrollHeight;
+      }
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      var lv2 = document.getElementById('log-viewer');
+      if (lv2) lv2.textContent = 'Error: ' + e.message;
+    }
+  }
+
+  await fetchLogs();
+  state.refreshTimer = setInterval(fetchLogs, 3000);
+}
+
+// ── Config tab ───────────────────────────────────────────────────
+async function renderConfig(gen) {
+  var content = document.getElementById('tab-content');
+  clear(content);
+  content.appendChild(h('div', { className: 'loading', textContent: 'Loading config...' }));
+
+  try {
+    var res = await api('/instances/' + encodeURIComponent(state.instance) + '/config');
+    if (gen !== state.routeGeneration) return;
+    if (res.status !== 200) {
+      clear(content);
+      content.appendChild(h('div', { className: 'notify notify-error', textContent: (res.data && res.data.error) || 'Failed to load config' }));
+      return;
+    }
+    state.configEtag = res.data.etag;
+    paintConfig(res.data);
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    clear(content);
+    content.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+  }
+}
+
+function paintConfig(data) {
+  var content = document.getElementById('tab-content');
+  clear(content);
+
+  var notifyArea = h('div', { id: 'config-notify' });
+  content.appendChild(notifyArea);
+
+  var panel = h('div', { className: 'panel' });
+  var header = h('div', { className: 'panel-header' },
+    h('span', { className: 'panel-title', textContent: 'Configuration (TOML)' }),
+    h('div', { className: 'btn-group' },
+      h('button', { className: 'btn', id: 'btn-validate', textContent: 'Validate' }),
+      h('button', { className: 'btn', id: 'btn-diff', textContent: 'Diff' }),
+      h('button', { className: 'btn btn-primary', id: 'btn-save', textContent: 'Save' })
+    )
+  );
+  panel.appendChild(header);
+
+  var editor = h('textarea', { className: 'config-editor', id: 'config-editor' });
+  editor.value = data.config_toml || '';
+  panel.appendChild(editor);
+
+  var diffArea = h('div', { id: 'diff-area' });
+  panel.appendChild(diffArea);
+
+  var conflictArea = h('div', { id: 'conflict-area' });
+  panel.appendChild(conflictArea);
+
+  content.appendChild(panel);
+
+  // Wire up buttons
+  document.getElementById('btn-validate').addEventListener('click', doValidate);
+  document.getElementById('btn-diff').addEventListener('click', doDiff);
+  document.getElementById('btn-save').addEventListener('click', doSave);
+}
+
+async function doValidate() {
+  var notify = document.getElementById('config-notify');
+  var editor = document.getElementById('config-editor');
+  if (!editor) return;
+  try {
+    var res = await api('/instances/' + encodeURIComponent(state.instance) + '/config/validate', {
+      method: 'POST',
+      body: { config: editor.value }
+    });
+    if (res.data && res.data.valid) {
+      showNotify(notify, 'success', 'Config is valid');
+    } else {
+      showNotify(notify, 'error', 'Invalid: ' + ((res.data && res.data.error) || 'Unknown error'));
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    showNotify(notify, 'error', 'Validation failed: ' + e.message);
+  }
+}
+
+async function doDiff() {
+  var editor = document.getElementById('config-editor');
+  var diffArea = document.getElementById('diff-area');
+  if (!editor || !diffArea) return;
+  clear(diffArea);
+  try {
+    var res = await api('/instances/' + encodeURIComponent(state.instance) + '/config/diff', {
+      method: 'POST',
+      body: { config: editor.value }
+    });
+    if (res.status !== 200) {
+      var notify = document.getElementById('config-notify');
+      showNotify(notify, 'error', (res.data && res.data.error) || 'Diff failed');
+      return;
+    }
+    var d = res.data;
+    var panel = h('div', { className: 'diff-panel' });
+    if (d.changes && d.changes.length > 0) {
+      panel.appendChild(h('div', { className: 'diff-change', style: 'margin-bottom:8px;font-weight:600', textContent: 'Changes:' }));
+      for (var c of d.changes) {
+        var line = h('div', { className: 'diff-change' });
+        line.textContent = '  ' + c.path + ': ' + JSON.stringify(c.from) + ' -> ' + JSON.stringify(c.to);
+        panel.appendChild(line);
+      }
+    }
+    if (d.added && d.added.length > 0) {
+      panel.appendChild(h('div', { className: 'diff-add', style: 'margin-top:8px;font-weight:600', textContent: 'Added:' }));
+      for (var a of d.added) {
+        var aLine = h('div', { className: 'diff-add' });
+        aLine.textContent = '  + ' + a.path + ': ' + JSON.stringify(a.value);
+        panel.appendChild(aLine);
+      }
+    }
+    if (d.removed && d.removed.length > 0) {
+      panel.appendChild(h('div', { className: 'diff-remove', style: 'margin-top:8px;font-weight:600', textContent: 'Removed:' }));
+      for (var r of d.removed) {
+        var rLine = h('div', { className: 'diff-remove' });
+        rLine.textContent = '  - ' + r.path + ': ' + JSON.stringify(r.value);
+        panel.appendChild(rLine);
+      }
+    }
+    if ((!d.changes || d.changes.length === 0) && (!d.added || d.added.length === 0) && (!d.removed || d.removed.length === 0)) {
+      panel.appendChild(h('div', { textContent: 'No changes detected.', style: 'color:var(--text-dim)' }));
+    }
+    if (d.unchanged_count != null) {
+      panel.appendChild(h('div', { style: 'margin-top:8px;color:var(--text-dim);font-size:12px', textContent: d.unchanged_count + ' fields unchanged' }));
+    }
+    diffArea.appendChild(panel);
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+  }
+}
+
+async function doSave() {
+  var editor = document.getElementById('config-editor');
+  var notify = document.getElementById('config-notify');
+  var conflictArea = document.getElementById('conflict-area');
+  if (!editor) return;
+
+  var btn = document.getElementById('btn-save');
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving...'; }
+
+  try {
+    var res = await api('/instances/' + encodeURIComponent(state.instance) + '/config', {
+      method: 'PUT',
+      body: { config: editor.value, etag: state.configEtag }
+    });
+
+    if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
+
+    if (res.status === 200) {
+      state.configEtag = res.data.etag;
+      showNotify(notify, 'success', 'Config saved successfully');
+      if (conflictArea) clear(conflictArea);
+      if (res.data.restart_recommended) {
+        showNotify(notify, 'warn', 'Instance is running - restart recommended for changes to take effect');
+      }
+    } else if (res.status === 409) {
+      // Conflict
+      if (conflictArea) {
+        clear(conflictArea);
+        var dialog = h('div', { className: 'conflict-dialog' },
+          h('h3', { textContent: 'Conflict Detected' }),
+          h('p', { textContent: 'Config was modified elsewhere since you loaded it. Your local changes have NOT been saved.' }),
+          h('p', { textContent: 'You may want to copy your changes before reloading.', style: 'font-style:italic' }),
+          h('button', { className: 'btn btn-primary', textContent: 'Reload Config', onClick: function() {
+            renderConfig(state.routeGeneration);
+          }})
+        );
+        conflictArea.appendChild(dialog);
+      }
+    } else if (res.status === 400) {
+      var msg = (res.data && res.data.error) || 'Invalid config';
+      showNotify(notify, 'error', msg);
+      if (res.data && res.data.blocked_fields) {
+        showNotify(notify, 'error', msg + ' - Blocked fields: ' + res.data.blocked_fields.join(', '));
+      }
+    } else {
+      showNotify(notify, 'error', (res.data && res.data.error) || 'Save failed');
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
+    showNotify(notify, 'error', 'Save error: ' + e.message);
+  }
+}
+
+// ── Events tab ───────────────────────────────────────────────────
+async function renderEvents(gen) {
+  var content = document.getElementById('tab-content');
+  clear(content);
+  content.appendChild(h('div', { className: 'loading', textContent: 'Loading events...' }));
+
+  var offset = 0;
+  var limit = 20;
+
+  async function load() {
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/tasks?limit=' + limit + '&offset=' + offset);
+      if (gen !== state.routeGeneration) return;
+      if (res.status !== 200) {
+        clear(content);
+        content.appendChild(h('div', { className: 'notify notify-error', textContent: (res.data && res.data.error) || 'Failed to load events' }));
+        return;
+      }
+      paintEvents(res.data, gen);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      clear(content);
+      content.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function paintEvents(data) {
+    clear(content);
+    var panel = h('div', { className: 'panel' });
+    panel.appendChild(h('div', { className: 'panel-title', textContent: 'Events', style: 'margin-bottom:12px' }));
+
+    var tasks = data.tasks || [];
+    if (tasks.length === 0) {
+      panel.appendChild(h('div', { className: 'empty-state', textContent: data.message || 'No events recorded yet.' }));
+      content.appendChild(panel);
+      return;
+    }
+
+    var table = h('table', { className: 'data-table' });
+    var thead = h('thead', null,
+      h('tr', null,
+        h('th', { textContent: 'Time' }),
+        h('th', { textContent: 'Type' }),
+        h('th', { textContent: 'Channel' }),
+        h('th', { textContent: 'Summary' }),
+        h('th', { textContent: 'Status' }),
+        h('th', { textContent: 'Duration' })
+      )
+    );
+    table.appendChild(thead);
+
+    var tbody = h('tbody');
+    for (var t of tasks) {
+      var row = h('tr', null,
+        h('td', { textContent: fmtTime(t.created_at) }),
+        h('td', { textContent: t.event_type || '-' }),
+        h('td', { textContent: t.channel || '-' }),
+        h('td', { textContent: t.summary || '-' }),
+        h('td', null, h('span', { className: 'status ' + statusClass(t.status === 'completed' ? 'running' : t.status === 'failed' ? 'dead' : 'unknown'), textContent: t.status || '-' })),
+        h('td', { textContent: fmtDuration(t.duration_ms) })
+      );
+      tbody.appendChild(row);
+    }
+    table.appendChild(tbody);
+    panel.appendChild(table);
+
+    // Pagination
+    var total = data.total || 0;
+    var pag = h('div', { className: 'pagination' },
+      h('span', { textContent: 'Showing ' + (offset + 1) + '-' + (offset + tasks.length) + ' of ' + total })
+    );
+    if (offset > 0) {
+      pag.appendChild(h('button', { className: 'btn', textContent: 'Previous', onClick: function() { offset = Math.max(0, offset - limit); load(); } }));
+    }
+    if (offset + limit < total) {
+      pag.appendChild(h('button', { className: 'btn', textContent: 'Next', onClick: function() { offset += limit; load(); } }));
+    }
+    panel.appendChild(pag);
+    content.appendChild(panel);
+  }
+
+  await load();
+}
+
+// ── Usage tab ────────────────────────────────────────────────────
+async function renderUsage(gen) {
+  var content = document.getElementById('tab-content');
+  clear(content);
+
+  var currentWindow = '24h';
+
+  async function load(win) {
+    currentWindow = win;
+    clear(content);
+
+    // Window selector
+    var selector = h('div', { className: 'window-select', style: 'margin-bottom:16px' });
+    var windows = ['1h', '24h', '7d', '30d'];
+    for (var i = 0; i < windows.length; i++) {
+      (function(w) {
+        selector.appendChild(h('button', {
+          className: 'window-btn' + (w === currentWindow ? ' active' : ''),
+          textContent: w,
+          onClick: function() { load(w); }
+        }));
+      })(windows[i]);
+    }
+    content.appendChild(selector);
+    content.appendChild(h('div', { className: 'loading', textContent: 'Loading usage data...' }));
+
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/usage?window=' + win);
+      if (gen !== state.routeGeneration) return;
+      if (res.status !== 200) {
+        // Remove loading
+        var loading = content.querySelector('.loading');
+        if (loading) loading.remove();
+        content.appendChild(h('div', { className: 'notify notify-error', textContent: (res.data && res.data.error) || 'Failed to load usage' }));
+        return;
+      }
+      paintUsage(res.data, selector);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      var ld = content.querySelector('.loading');
+      if (ld) ld.remove();
+      content.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function paintUsage(data, selector) {
+    clear(content);
+    content.appendChild(selector);
+
+    var usage = data.usage || {};
+
+    if (!data.data_available) {
+      content.appendChild(h('div', { className: 'empty-state', textContent: 'No usage data available for this window.' }));
+      return;
+    }
+
+    var grid = h('div', { className: 'usage-grid' });
+    var stats = [
+      { label: 'Input Tokens', value: fmtNum(usage.input_tokens) },
+      { label: 'Output Tokens', value: fmtNum(usage.output_tokens) },
+      { label: 'Total Tokens', value: fmtNum(usage.total_tokens) },
+      { label: 'Requests', value: fmtNum(usage.request_count) },
+    ];
+    for (var s of stats) {
+      grid.appendChild(h('div', { className: 'usage-stat' },
+        h('div', { className: 'usage-stat-label', textContent: s.label }),
+        h('div', { className: 'usage-stat-value', textContent: s.value })
+      ));
+    }
+    content.appendChild(grid);
+  }
+
+  await load(currentWindow);
+}
+
+// ── Health status ────────────────────────────────────────────────
+async function refreshHealth() {
+  try {
+    var resp = await fetch('/api/health');
+    var data = await resp.json();
+    var el = document.getElementById('health-status');
+    if (el) {
+      el.textContent = data.status === 'ok' ? 'API: Connected' : 'API: Error';
+      el.style.color = data.status === 'ok' ? 'var(--green)' : 'var(--red)';
+    }
+  } catch (e) {
+    var el = document.getElementById('health-status');
+    if (el) { el.textContent = 'API: Disconnected'; el.style.color = 'var(--red)'; }
+  }
+}
+
+// ── Init ─────────────────────────────────────────────────────────
+route();
+refreshHealth();
+setInterval(refreshHealth, 15000);
+</script>
+</body>
+</html>
