@@ -78,12 +78,24 @@ fn crash_recovery_scoped_by_run_id() -> Result<()> {
     let result = migrate::reconcile_inner(&cp_dir, &registry, &instances_dir)?;
 
     // id-1 should be removed (run_id matched)
-    assert!(registry.get_instance("id-1")?.is_none(), "id-1 DB row should be deleted");
-    assert!(!instances_dir.join("id-1").exists(), "id-1 FS dir should be deleted");
+    assert!(
+        registry.get_instance("id-1")?.is_none(),
+        "id-1 DB row should be deleted"
+    );
+    assert!(
+        !instances_dir.join("id-1").exists(),
+        "id-1 FS dir should be deleted"
+    );
 
     // id-2 should still exist (run_id mismatch: DB row kept, FS kept)
-    assert!(registry.get_instance("id-2")?.is_some(), "id-2 DB row should exist");
-    assert!(instances_dir.join("id-2").exists(), "id-2 FS dir should exist");
+    assert!(
+        registry.get_instance("id-2")?.is_some(),
+        "id-2 DB row should exist"
+    );
+    assert!(
+        instances_dir.join("id-2").exists(),
+        "id-2 FS dir should exist"
+    );
 
     // Manifest should be deleted (all actionable cleanups succeeded)
     let pending_files: Vec<_> = fs::read_dir(&cp_dir)?
@@ -136,7 +148,10 @@ fn crash_recovery_retry_orphaned_dir() -> Result<()> {
                 .starts_with("migration-pending-")
         })
         .collect();
-    assert!(pending_files.is_empty(), "Manifest should be deleted after retry success");
+    assert!(
+        pending_files.is_empty(),
+        "Manifest should be deleted after retry success"
+    );
     assert!(result);
     Ok(())
 }
@@ -212,9 +227,7 @@ fn manifest_mismatch_quarantined() -> Result<()> {
     assert!(!path.exists(), "Original manifest should be gone");
     let quarantine = cp_dir.join("quarantine");
     assert!(quarantine.exists(), "Quarantine dir should be created");
-    let q_files: Vec<_> = fs::read_dir(&quarantine)?
-        .filter_map(|e| e.ok())
-        .collect();
+    let q_files: Vec<_> = fs::read_dir(&quarantine)?.filter_map(|e| e.ok()).collect();
     assert_eq!(q_files.len(), 1, "One file should be in quarantine");
 
     assert!(!result, "reconcile_inner should return false (unresolved)");

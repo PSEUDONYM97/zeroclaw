@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::sync::watch;
 
@@ -148,7 +148,8 @@ fn reconcile_instance(registry: &Registry, instance: &crate::db::Instance, inst_
 ///
 /// Exits when the shutdown signal is received.
 pub async fn run_supervisor(db_path: Arc<PathBuf>, mut shutdown: watch::Receiver<bool>) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(SUPERVISOR_INTERVAL_SECS));
+    let mut interval =
+        tokio::time::interval(std::time::Duration::from_secs(SUPERVISOR_INTERVAL_SECS));
     // First tick fires immediately; skip it since startup_reconcile already ran.
     interval.tick().await;
 

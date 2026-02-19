@@ -145,7 +145,7 @@ impl Registry {
 
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_instances_active_name
-             ON instances(name) WHERE archived_at IS NULL;"
+             ON instances(name) WHERE archived_at IS NULL;",
         )?;
 
         // Phase 7.5: agent_events table
@@ -164,7 +164,7 @@ impl Registry {
                 FOREIGN KEY (instance_id) REFERENCES instances(id)
             );
             CREATE INDEX IF NOT EXISTS idx_agent_events_instance_created
-                ON agent_events(instance_id, created_at DESC);"
+                ON agent_events(instance_id, created_at DESC);",
         )?;
 
         // Phase 7.5: agent_usage table
@@ -182,7 +182,7 @@ impl Registry {
                 FOREIGN KEY (instance_id) REFERENCES instances(id)
             );
             CREATE INDEX IF NOT EXISTS idx_agent_usage_instance_created
-                ON agent_usage(instance_id, created_at DESC);"
+                ON agent_usage(instance_id, created_at DESC);",
         )?;
 
         Ok(())
@@ -390,7 +390,8 @@ impl Registry {
     ) -> Result<(Vec<AgentEvent>, usize)> {
         let mut where_clauses = vec!["instance_id = ?1".to_string()];
         let mut param_idx = 2u32;
-        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(instance_id.to_string())];
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(instance_id.to_string())];
 
         if let Some(status) = status_filter {
             where_clauses.push(format!("status = ?{param_idx}"));
@@ -412,10 +413,13 @@ impl Registry {
 
         // Count total
         let count_sql = format!("SELECT COUNT(*) FROM agent_events WHERE {where_sql}");
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
-        let total: usize = self.conn.query_row(&count_sql, params_ref.as_slice(), |row| {
-            row.get::<_, i64>(0).map(|v| v as usize)
-        })?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let total: usize = self
+            .conn
+            .query_row(&count_sql, params_ref.as_slice(), |row| {
+                row.get::<_, i64>(0).map(|v| v as usize)
+            })?;
 
         // Query with pagination
         let query_sql = format!(
@@ -429,7 +433,8 @@ impl Registry {
         all_params.push(Box::new(limit as i64));
         all_params.push(Box::new(offset as i64));
 
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|b| b.as_ref()).collect();
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|b| b.as_ref()).collect();
         let mut stmt = self.conn.prepare(&query_sql)?;
         let rows = stmt.query_map(params_ref.as_slice(), |row| {
             Ok(AgentEvent {
@@ -483,7 +488,8 @@ impl Registry {
         window_end: Option<&str>,
     ) -> Result<AgentUsageSummary> {
         let mut where_clauses = vec!["instance_id = ?1".to_string()];
-        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(instance_id.to_string())];
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(instance_id.to_string())];
         let mut param_idx = 2u32;
 
         if let Some(start) = window_start {
@@ -507,16 +513,19 @@ impl Registry {
              FROM agent_usage WHERE {where_sql}"
         );
 
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
-        self.conn.query_row(&sql, params_ref.as_slice(), |row| {
-            Ok(AgentUsageSummary {
-                input_tokens: row.get(0)?,
-                output_tokens: row.get(1)?,
-                total_tokens: row.get(2)?,
-                request_count: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as usize,
-                unknown_count: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as usize,
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        self.conn
+            .query_row(&sql, params_ref.as_slice(), |row| {
+                Ok(AgentUsageSummary {
+                    input_tokens: row.get(0)?,
+                    output_tokens: row.get(1)?,
+                    total_tokens: row.get(2)?,
+                    request_count: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as usize,
+                    unknown_count: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as usize,
+                })
             })
-        }).context("Failed to query agent usage")
+            .context("Failed to query agent usage")
     }
 
     /// List all non-archived instances.
@@ -553,8 +562,15 @@ mod tests {
     #[test]
     fn create_and_get_instance() {
         let reg = Registry::open_in_memory().unwrap();
-        reg.create_instance("id-1", "test-agent", 18801, "/tmp/config.toml", Some("/tmp/ws"), None)
-            .unwrap();
+        reg.create_instance(
+            "id-1",
+            "test-agent",
+            18801,
+            "/tmp/config.toml",
+            Some("/tmp/ws"),
+            None,
+        )
+        .unwrap();
 
         let inst = reg.get_instance("id-1").unwrap().unwrap();
         assert_eq!(inst.name, "test-agent");
@@ -577,7 +593,10 @@ mod tests {
             .unwrap();
 
         assert!(reg.get_instance_by_name("agent").unwrap().is_none());
-        assert!(reg.find_archived_instance_by_name("agent").unwrap().is_some());
+        assert!(reg
+            .find_archived_instance_by_name("agent")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -616,9 +635,7 @@ mod tests {
         reg.create_instance("id-2", "a2", 18802, "/c.toml", None, None)
             .unwrap();
 
-        let port = reg
-            .allocate_port_with_excludes(18801, 18802, &[])
-            .unwrap();
+        let port = reg.allocate_port_with_excludes(18801, 18802, &[]).unwrap();
         assert!(port.is_none());
     }
 
@@ -661,8 +678,15 @@ mod tests {
         assert!(inst.migration_run_id.is_none());
 
         // Verify: new instances with migration_run_id work
-        reg.create_instance("new-1", "new-agent", 18802, "/new/config.toml", None, Some("run-123"))
-            .unwrap();
+        reg.create_instance(
+            "new-1",
+            "new-agent",
+            18802,
+            "/new/config.toml",
+            None,
+            Some("run-123"),
+        )
+        .unwrap();
         let new_inst = reg.get_instance("new-1").unwrap().unwrap();
         assert_eq!(new_inst.migration_run_id.as_deref(), Some("run-123"));
     }

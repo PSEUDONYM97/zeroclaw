@@ -39,14 +39,7 @@ require_pairing = true
     .unwrap();
 
     registry
-        .create_instance(
-            &id,
-            name,
-            port,
-            config_path.to_str().unwrap(),
-            None,
-            None,
-        )
+        .create_instance(&id, name, port, config_path.to_str().unwrap(), None, None)
         .unwrap();
 
     (tmp, db_path, id, inst_dir)
@@ -54,9 +47,7 @@ require_pairing = true
 
 /// Helper: start an in-process axum server on a random port.
 /// Returns the base URL and a shutdown sender.
-async fn start_test_server(
-    db_path: PathBuf,
-) -> (String, tokio::sync::watch::Sender<bool>) {
+async fn start_test_server(db_path: PathBuf) -> (String, tokio::sync::watch::Sender<bool>) {
     let state = cp::server::CpState {
         db_path: Arc::new(db_path),
     };
@@ -101,7 +92,10 @@ fn gate1_crash_detection() -> Result<()> {
     // Verify: status corrected to stopped, pidfile removed
     let registry = Registry::open(&db_path)?;
     let inst = registry.get_instance(&id)?.unwrap();
-    assert_eq!(inst.status, "stopped", "Status should be corrected to stopped");
+    assert_eq!(
+        inst.status, "stopped",
+        "Status should be corrected to stopped"
+    );
     assert!(inst.pid.is_none(), "DB PID cache should be cleared");
     assert!(
         !inst_dir.join("daemon.pid").exists(),
@@ -290,7 +284,11 @@ async fn gate3d_start_unknown_404() -> Result<()> {
         .post(format!("{base_url}/api/instances/ghost/start"))
         .send()
         .await?;
-    assert_eq!(resp.status(), 404, "Start on unknown instance should be 404, not 500");
+    assert_eq!(
+        resp.status(),
+        404,
+        "Start on unknown instance should be 404, not 500"
+    );
 
     let _ = shutdown.send(true);
     Ok(())
@@ -367,14 +365,20 @@ async fn gate3g_logs_cap() -> Result<()> {
 
     // Request 99999 lines - should be clamped, returning all 20
     let resp = client
-        .get(format!("{base_url}/api/instances/logcap-test/logs?lines=99999"))
+        .get(format!(
+            "{base_url}/api/instances/logcap-test/logs?lines=99999"
+        ))
         .send()
         .await?;
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await?;
     let lines = body["lines"].as_array().unwrap();
-    assert_eq!(lines.len(), 20, "All 20 lines returned (file smaller than cap)");
+    assert_eq!(
+        lines.len(),
+        20,
+        "All 20 lines returned (file smaller than cap)"
+    );
 
     let _ = shutdown.send(true);
     Ok(())
@@ -429,7 +433,11 @@ async fn gate6_lifecycle_error_http_codes() -> Result<()> {
         .post(format!("{base_url}/api/instances/error-test/stop"))
         .send()
         .await?;
-    assert_eq!(resp.status(), 409, "Stopping a stopped instance should be 409");
+    assert_eq!(
+        resp.status(),
+        409,
+        "Stopping a stopped instance should be 409"
+    );
 
     let _ = shutdown.send(true);
     Ok(())

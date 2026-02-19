@@ -32,9 +32,7 @@ fn make_openclaw_config(
 
 /// Create a models.json for an agent.
 fn create_models_json(dir: &Path, provider: &str, api_key: &str) {
-    let models = format!(
-        r#"{{ "providers": {{ "{provider}": {{ "apiKey": "{api_key}" }} }} }}"#
-    );
+    let models = format!(r#"{{ "providers": {{ "{provider}": {{ "apiKey": "{api_key}" }} }} }}"#);
     fs::write(dir.join("models.json"), models).unwrap();
 }
 
@@ -156,15 +154,16 @@ fn gate2_channel_binding_correct() -> Result<()> {
 
     // Parse each created config TOML and verify telegram bindings
     for entry in &report.created {
-        let config_toml_path = instances_dir
-            .join(&entry.instance_id)
-            .join("config.toml");
+        let config_toml_path = instances_dir.join(&entry.instance_id).join("config.toml");
         let content = fs::read_to_string(&config_toml_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
         if entry.agent_id == "main" {
             let tg = &parsed["channels_config"]["telegram"];
-            assert_eq!(tg["bot_token"].as_str().unwrap(), "111:AAA-main-bot-token-long");
+            assert_eq!(
+                tg["bot_token"].as_str().unwrap(),
+                "111:AAA-main-bot-token-long"
+            );
             let users: Vec<&str> = tg["allowed_users"]
                 .as_array()
                 .unwrap()
@@ -174,7 +173,10 @@ fn gate2_channel_binding_correct() -> Result<()> {
             assert_eq!(users, vec!["user_a"]);
         } else if entry.agent_id == "helper" {
             let tg = &parsed["channels_config"]["telegram"];
-            assert_eq!(tg["bot_token"].as_str().unwrap(), "222:BBB-helper-bot-token-long");
+            assert_eq!(
+                tg["bot_token"].as_str().unwrap(),
+                "222:BBB-helper-bot-token-long"
+            );
             let users: Vec<&str> = tg["allowed_users"]
                 .as_array()
                 .unwrap()
@@ -228,19 +230,31 @@ fn gate3_unsupported_field_warnings() -> Result<()> {
 
     assert!(report.errors.is_empty());
     assert!(
-        report.warnings.iter().any(|w| w.contains("Tool definitions")),
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("Tool definitions")),
         "Should warn about tools"
     );
     assert!(
-        report.warnings.iter().any(|w| w.contains("Plugin configurations")),
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("Plugin configurations")),
         "Should warn about plugins"
     );
     assert!(
-        report.warnings.iter().any(|w| w.contains("Custom commands")),
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("Custom commands")),
         "Should warn about commands"
     );
     assert!(
-        report.warnings.iter().any(|w| w.contains("Skill definitions")),
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("Skill definitions")),
         "Should warn about skills"
     );
 
@@ -415,8 +429,14 @@ fn gate6_idempotency_block() -> Result<()> {
         &registry,
         &instances_dir,
     )?;
-    assert!(!report2.errors.is_empty(), "Second migration should have errors");
-    assert!(report2.created.is_empty(), "No new instances on re-migration");
+    assert!(
+        !report2.errors.is_empty(),
+        "Second migration should have errors"
+    );
+    assert!(
+        report2.created.is_empty(),
+        "No new instances on re-migration"
+    );
 
     // Instance count unchanged
     assert_eq!(registry.list_instances()?.len(), count_after_first);
@@ -449,9 +469,7 @@ fn gate7_static_startability_checks() -> Result<()> {
         assert_eq!(inst.status, "stopped");
 
         // b) Config path is file with 0600 perms
-        let config_toml_path = instances_dir
-            .join(&entry.instance_id)
-            .join("config.toml");
+        let config_toml_path = instances_dir.join(&entry.instance_id).join("config.toml");
         assert!(config_toml_path.is_file(), "config.toml must exist");
         let perms = fs::metadata(&config_toml_path)?.permissions();
         assert_eq!(
@@ -473,10 +491,7 @@ fn gate7_static_startability_checks() -> Result<()> {
         );
 
         // d) api_key present (our test setup provides it)
-        assert!(
-            parsed.get("api_key").is_some(),
-            "api_key should be present"
-        );
+        assert!(parsed.get("api_key").is_some(), "api_key should be present");
 
         // e) channels_config.telegram present (our test has telegram bindings)
         assert!(
