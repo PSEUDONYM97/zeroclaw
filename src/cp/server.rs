@@ -4,14 +4,17 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
 
-use crate::cp::masking::{collect_key_paths, mask_config_secrets};
+use crate::cp::masking::{
+    collect_key_paths, diff_json, mask_config_secrets, preserve_masked_secrets,
+};
 use crate::db::Registry;
 use crate::lifecycle;
 use crate::lifecycle::LifecycleError;
@@ -69,7 +72,11 @@ fn read_lines_paginated(
     let text = String::from_utf8_lossy(&buf);
     let all_lines: Vec<&str> = text.lines().collect();
 
-    let skip = if truncated && !all_lines.is_empty() { 1 } else { 0 };
+    let skip = if truncated && !all_lines.is_empty() {
+        1
+    } else {
+        0
+    };
     let usable = &all_lines[skip..];
     let window_lines = usable.len();
 
@@ -104,6 +111,15 @@ pub fn build_router(state: CpState) -> Router {
             "/api/instances/:name/logs/download",
             get(handle_logs_download),
         )
+        .route(
+            "/api/instances/:name/config",
+            get(handle_config_get).put(handle_config_put),
+        )
+        .route(
+            "/api/instances/:name/config/validate",
+            post(handle_config_validate),
+        )
+        .route("/api/instances/:name/config/diff", post(handle_config_diff))
         .with_state(state)
 }
 
@@ -125,19 +141,14 @@ fn lifecycle_err_to_response(e: LifecycleError) -> ApiResponse {
         LifecycleError::AlreadyRunning(_) => err_json(StatusCode::CONFLICT, &e.to_string()),
         LifecycleError::NotRunning(_) => err_json(StatusCode::CONFLICT, &e.to_string()),
         LifecycleError::LockHeld => err_json(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
-        LifecycleError::Internal(_) => {
-            err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
-        }
+        LifecycleError::Internal(_) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
 fn open_registry(db_path: &Path) -> Result<Registry, ApiResponse> {
     Registry::open(db_path).map_err(|e| {
         tracing::error!("Failed to open registry: {e:#}");
-        err_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to open registry",
-        )
+        err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open registry")
     })
 }
 
@@ -417,10 +428,7 @@ async fn handle_logs(
                 })),
                 Err(e) => {
                     tracing::error!("Failed to read log file: {e}");
-                    err_json(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to read log file",
-                    )
+                    err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to read log file")
                 }
             }
         } else {
@@ -432,10 +440,7 @@ async fn handle_logs(
                 })),
                 Err(e) => {
                     tracing::error!("Failed to read log file: {e}");
-                    err_json(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to read log file",
-                    )
+                    err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to read log file")
                 }
             }
         }
@@ -521,22 +526,16 @@ async fn handle_logs_download(
                 Ok(f) => f,
                 Err(e) => {
                     tracing::error!("Failed to open rotated log: {e}");
-                    return err_json(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to open log file",
-                    )
-                    .into_response();
+                    return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open log file")
+                        .into_response();
                 }
             };
             let current_file = match tokio::fs::File::open(&log_path).await {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::error!("Failed to open current log: {e}");
-                    return err_json(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to open log file",
-                    )
-                    .into_response();
+                    return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open log file")
+                        .into_response();
                 }
             };
             let rotated_stream = ReaderStream::new(rotated_file);
@@ -548,11 +547,8 @@ async fn handle_logs_download(
                 Ok(f) => f,
                 Err(e) => {
                     tracing::error!("Failed to open rotated log: {e}");
-                    return err_json(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to open log file",
-                    )
-                    .into_response();
+                    return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open log file")
+                        .into_response();
                 }
             };
             Body::from_stream(ReaderStream::new(file))
@@ -562,11 +558,8 @@ async fn handle_logs_download(
                 Ok(f) => f,
                 Err(e) => {
                     tracing::error!("Failed to open current log: {e}");
-                    return err_json(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to open log file",
-                    )
-                    .into_response();
+                    return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open log file")
+                        .into_response();
                 }
             };
             Body::from_stream(ReaderStream::new(file))
@@ -641,10 +634,8 @@ async fn handle_details(
                                 let raw_json = serde_json::to_value(&raw_val).unwrap_or_default();
                                 let raw_paths = collect_key_paths(&raw_json, "");
                                 let typed_paths = collect_key_paths(&config_val, "");
-                                let diff: Vec<String> = raw_paths
-                                    .difference(&typed_paths)
-                                    .cloned()
-                                    .collect();
+                                let diff: Vec<String> =
+                                    raw_paths.difference(&typed_paths).cloned().collect();
                                 if diff.is_empty() {
                                     serde_json::Value::Array(vec![])
                                 } else {
@@ -692,10 +683,7 @@ async fn handle_details(
         // Extract channel info
         let channels = if let Some(ref cfg) = config_json {
             if let Some(cc) = cfg.get("channels_config") {
-                let cli = cc
-                    .get("cli")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let cli = cc.get("cli").and_then(|v| v.as_bool()).unwrap_or(false);
                 let mut ch = serde_json::json!({ "cli": cli });
                 for channel_name in &[
                     "telegram", "discord", "slack", "webhook", "imessage", "matrix", "whatsapp",
@@ -777,7 +765,11 @@ async fn handle_details(
         });
 
         // Remove null config_error for cleaner output
-        if response.get("config_error").and_then(|v| v.as_null()).is_some() {
+        if response
+            .get("config_error")
+            .and_then(|v| v.as_null())
+            .is_some()
+        {
             if let Some(obj) = response.as_object_mut() {
                 obj.remove("config_error");
             }
@@ -831,9 +823,7 @@ async fn handle_tasks(
         if !["started", "completed", "failed"].contains(&status.as_str()) {
             return err_json(
                 StatusCode::BAD_REQUEST,
-                &format!(
-                    "Invalid status: '{status}'. Valid values: started, completed, failed"
-                ),
+                &format!("Invalid status: '{status}'. Valid values: started, completed, failed"),
             );
         }
     }
@@ -1004,6 +994,501 @@ async fn handle_usage(
                 err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query usage")
             }
         }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── Config API ──────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ConfigPutBody {
+    config: String, // TOML string
+    etag: String,   // SHA-256 hex of previous file bytes
+}
+
+#[derive(Deserialize)]
+struct ConfigBody {
+    config: String, // TOML string (used by validate + diff)
+}
+
+fn compute_config_etag(raw_bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(raw_bytes))
+}
+
+/// Produce masked TOML and masked JSON from a typed Config.
+fn masked_config_outputs(
+    config: &crate::config::schema::Config,
+) -> Result<(String, serde_json::Value), String> {
+    let mut config_json = serde_json::to_value(config).map_err(|e| format!("{e}"))?;
+    mask_config_secrets(&mut config_json);
+    // Deserialize masked JSON back to Config, then serialize to pretty TOML
+    let masked_config: crate::config::schema::Config =
+        serde_json::from_value(config_json.clone()).map_err(|e| format!("{e}"))?;
+    let toml_str = toml::to_string_pretty(&masked_config).map_err(|e| format!("{e}"))?;
+    Ok((toml_str, config_json))
+}
+
+// ── GET /api/instances/:name/config ─────────────────────────────
+
+async fn handle_config_get(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let db_path = state.db_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to query instance",
+                );
+            }
+        };
+
+        let config_path = Path::new(&instance.config_path);
+        let raw_bytes = match std::fs::read(config_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return err_json(StatusCode::NOT_FOUND, "Config file not found")
+            }
+            Err(e) => {
+                tracing::error!("Failed to read config: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to read config file",
+                );
+            }
+        };
+
+        let etag = compute_config_etag(&raw_bytes);
+
+        let raw_str = match String::from_utf8(raw_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Config file is not valid UTF-8",
+                )
+            }
+        };
+
+        let config: crate::config::schema::Config = match toml::from_str(&raw_str) {
+            Ok(c) => c,
+            Err(e) => {
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Config parse error: {e}"),
+                )
+            }
+        };
+
+        let (masked_toml, masked_json) = match masked_config_outputs(&config) {
+            Ok(v) => v,
+            Err(msg) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+        };
+
+        ok_json(serde_json::json!({
+            "name": name,
+            "config_toml": masked_toml,
+            "config_masked": masked_json,
+            "etag": etag,
+        }))
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── PUT /api/instances/:name/config ─────────────────────────────
+
+async fn handle_config_put(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+    Json(body): Json<ConfigPutBody>,
+) -> impl IntoResponse {
+    let db_path = state.db_path.clone();
+    let allow_secret_write = headers
+        .get("x-allow-secret-write")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |v| v.eq_ignore_ascii_case("true"));
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to query instance",
+                );
+            }
+        };
+
+        // Validate etag is non-empty
+        if body.etag.is_empty() {
+            return err_json(StatusCode::BAD_REQUEST, "ETag is required");
+        }
+
+        let config_path_str = instance.config_path.clone();
+        let config_path = Path::new(&config_path_str);
+
+        // Read current file, compute current ETag
+        let current_bytes = match std::fs::read(config_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return err_json(StatusCode::NOT_FOUND, "Config file not found")
+            }
+            Err(e) => {
+                tracing::error!("Failed to read config: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to read config file",
+                );
+            }
+        };
+
+        let current_etag = compute_config_etag(&current_bytes);
+        if body.etag != current_etag {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ETag mismatch: config modified since last read",
+                    "current_etag": current_etag,
+                })),
+            );
+        }
+
+        // Parse incoming TOML as Config
+        let incoming_config: crate::config::schema::Config = match toml::from_str(&body.config) {
+            Ok(c) => c,
+            Err(e) => return err_json(StatusCode::BAD_REQUEST, &format!("Invalid config: {e}")),
+        };
+
+        // Parse current config for sentinel preservation
+        let current_str = String::from_utf8_lossy(&current_bytes);
+        let current_config: crate::config::schema::Config = match toml::from_str(&current_str) {
+            Ok(c) => c,
+            Err(e) => {
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Current config parse error: {e}"),
+                )
+            }
+        };
+
+        let mut incoming_json = serde_json::to_value(&incoming_config).unwrap_or_default();
+        let current_json = serde_json::to_value(&current_config).unwrap_or_default();
+
+        // Preserve masked sentinels
+        match preserve_masked_secrets(&mut incoming_json, &current_json) {
+            Err((_path, msg)) => {
+                return err_json(StatusCode::BAD_REQUEST, &msg);
+            }
+            Ok(new_secret_paths) => {
+                // Block new secrets unless header allows
+                if !new_secret_paths.is_empty() && !allow_secret_write {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "Config contains secret fields blocked by default",
+                            "blocked_fields": new_secret_paths,
+                            "hint": "Set header X-Allow-Secret-Write: true to allow",
+                        })),
+                    );
+                }
+            }
+        }
+
+        // Deserialize merged JSON back to Config
+        let mut final_config: crate::config::schema::Config =
+            match serde_json::from_value(incoming_json) {
+                Ok(c) => c,
+                Err(e) => {
+                    return err_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("Failed to reconstruct config: {e}"),
+                    )
+                }
+            };
+
+        // Acquire lifecycle lock
+        let inst_dir = lifecycle::instance_dir_from(&instance);
+        let _lock = match lifecycle::try_lifecycle_lock(&inst_dir) {
+            Ok(lifecycle::LockOutcome::Acquired(f)) => f,
+            Ok(lifecycle::LockOutcome::Contended) => {
+                return err_json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Lifecycle lock held (concurrent operation in progress)",
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to acquire lifecycle lock: {e:#}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to acquire lifecycle lock",
+                );
+            }
+        };
+
+        // Double-check ETag after lock acquisition
+        let recheck_bytes = match std::fs::read(config_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("Failed to re-read config: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to re-read config file",
+                );
+            }
+        };
+        let recheck_etag = compute_config_etag(&recheck_bytes);
+        if body.etag != recheck_etag {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ETag mismatch: config modified since last read",
+                    "current_etag": recheck_etag,
+                })),
+            );
+        }
+
+        // Set skip fields
+        final_config.config_path = PathBuf::from(&config_path_str);
+        final_config.workspace_dir = inst_dir.join("workspace");
+
+        // Atomic write
+        if let Err(e) = final_config.save() {
+            tracing::error!("Failed to save config: {e:#}");
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to save config: {e}"),
+            );
+        }
+
+        // Compute new ETag
+        let new_bytes = match std::fs::read(config_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("Failed to read saved config: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Config saved but failed to compute new ETag",
+                );
+            }
+        };
+        let new_etag = compute_config_etag(&new_bytes);
+
+        // Check if instance is running
+        let (live_status, _live_pid) =
+            lifecycle::live_status(&inst_dir).unwrap_or(("unknown".to_string(), None));
+        let restart_recommended = live_status == "running";
+
+        ok_json(serde_json::json!({
+            "status": "saved",
+            "name": name,
+            "etag": new_etag,
+            "restart_recommended": restart_recommended,
+        }))
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── POST /api/instances/:name/config/validate ───────────────────
+
+async fn handle_config_validate(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<ConfigBody>,
+) -> impl IntoResponse {
+    let db_path = state.db_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        // Verify instance exists
+        match registry.get_instance_by_name(&name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to query instance",
+                );
+            }
+        };
+
+        match toml::from_str::<crate::config::schema::Config>(&body.config) {
+            Ok(_) => ok_json(serde_json::json!({ "valid": true })),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "valid": false,
+                    "error": format!("{e}"),
+                })),
+            ),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── POST /api/instances/:name/config/diff ───────────────────────
+
+async fn handle_config_diff(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<ConfigBody>,
+) -> impl IntoResponse {
+    let db_path = state.db_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to query instance",
+                );
+            }
+        };
+
+        // Read + parse current config
+        let config_path = Path::new(&instance.config_path);
+        let current_bytes = match std::fs::read(config_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return err_json(StatusCode::NOT_FOUND, "Config file not found")
+            }
+            Err(e) => {
+                tracing::error!("Failed to read config: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to read config file",
+                );
+            }
+        };
+
+        let current_str = String::from_utf8_lossy(&current_bytes);
+
+        // Parse raw TOML for unknown field detection
+        let raw_toml_value: Result<toml::Value, _> = toml::from_str(&current_str);
+
+        let current_config: crate::config::schema::Config = match toml::from_str(&current_str) {
+            Ok(c) => c,
+            Err(e) => {
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Current config parse error: {e}"),
+                )
+            }
+        };
+
+        // Parse proposed config
+        let proposed_config: crate::config::schema::Config = match toml::from_str(&body.config) {
+            Ok(c) => c,
+            Err(e) => return err_json(StatusCode::BAD_REQUEST, &format!("Invalid config: {e}")),
+        };
+
+        // Mask both sides
+        let mut current_json = serde_json::to_value(&current_config).unwrap_or_default();
+        mask_config_secrets(&mut current_json);
+
+        let mut proposed_json = serde_json::to_value(&proposed_config).unwrap_or_default();
+        mask_config_secrets(&mut proposed_json);
+
+        // Diff
+        let diff = diff_json(&current_json, &proposed_json);
+
+        // Unknown fields warning
+        let unknown_fields_warning: Vec<String> = if let Ok(raw_val) = raw_toml_value {
+            let raw_json = serde_json::to_value(&raw_val).unwrap_or_default();
+            let raw_paths = collect_key_paths(&raw_json, "");
+            let typed_paths = collect_key_paths(&current_json, "");
+            raw_paths.difference(&typed_paths).cloned().collect()
+        } else {
+            Vec::new()
+        };
+
+        ok_json(serde_json::json!({
+            "changes": diff.changes,
+            "added": diff.added,
+            "removed": diff.removed,
+            "unchanged_count": diff.unchanged_count,
+            "unknown_fields_warning": unknown_fields_warning,
+        }))
     })
     .await;
 
