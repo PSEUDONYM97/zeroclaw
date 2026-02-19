@@ -26,16 +26,27 @@ Options:
 
 enum CliCommand {
     Serve,
-    Start { name: String },
-    Stop { name: String },
-    Restart { name: String },
-    Status { name: Option<String> },
+    Start {
+        name: String,
+    },
+    Stop {
+        name: String,
+    },
+    Restart {
+        name: String,
+    },
+    Status {
+        name: Option<String>,
+    },
     Logs {
         name: String,
         lines: usize,
         follow: bool,
     },
-    Migrate { path: PathBuf, dry_run: bool },
+    Migrate {
+        path: PathBuf,
+        dry_run: bool,
+    },
 }
 
 fn parse_args() -> Result<CliCommand> {
@@ -63,9 +74,7 @@ fn parse_args() -> Result<CliCommand> {
             if args.len() > 2 {
                 bail!("Unexpected arguments after instance name\n{USAGE}");
             }
-            Ok(CliCommand::Start {
-                name: name.clone(),
-            })
+            Ok(CliCommand::Start { name: name.clone() })
         }
         "stop" => {
             let name = args
@@ -74,9 +83,7 @@ fn parse_args() -> Result<CliCommand> {
             if args.len() > 2 {
                 bail!("Unexpected arguments after instance name\n{USAGE}");
             }
-            Ok(CliCommand::Stop {
-                name: name.clone(),
-            })
+            Ok(CliCommand::Stop { name: name.clone() })
         }
         "restart" => {
             let name = args
@@ -85,9 +92,7 @@ fn parse_args() -> Result<CliCommand> {
             if args.len() > 2 {
                 bail!("Unexpected arguments after instance name\n{USAGE}");
             }
-            Ok(CliCommand::Restart {
-                name: name.clone(),
-            })
+            Ok(CliCommand::Restart { name: name.clone() })
         }
         "status" => {
             let name = args.get(1).cloned();
@@ -298,10 +303,8 @@ async fn run_server() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Spawn supervisor
-    let supervisor_handle = tokio::spawn(cp::supervisor::run_supervisor(
-        db_path.clone(),
-        shutdown_rx,
-    ));
+    let supervisor_handle =
+        tokio::spawn(cp::supervisor::run_supervisor(db_path.clone(), shutdown_rx));
 
     // Build router
     let state = cp::server::CpState { db_path };
@@ -325,9 +328,8 @@ async fn run_server() -> Result<()> {
 
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to register SIGTERM handler");
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to register SIGTERM handler");
 
     tokio::select! {
         _ = ctrl_c => {
@@ -346,9 +348,8 @@ fn run_migration(config_path: &Path, dry_run: bool) -> Result<()> {
     std::fs::create_dir_all(&inst_dir)?;
 
     // Acquire migration lock
-    let _lock = migrate::acquire_migration_lock(&cp).context(
-        "Cannot migrate: lock held. Is the CP server running? Stop it first.",
-    )?;
+    let _lock = migrate::acquire_migration_lock(&cp)
+        .context("Cannot migrate: lock held. Is the CP server running? Stop it first.")?;
 
     let registry = Registry::open(&registry_path(&cp))?;
 
@@ -376,13 +377,8 @@ fn run_migration(config_path: &Path, dry_run: bool) -> Result<()> {
     }
 
     // Run the migration
-    let report = migrate::openclaw::run_openclaw_migration(
-        config_path,
-        dry_run,
-        &cp,
-        &registry,
-        &inst_dir,
-    )?;
+    let report =
+        migrate::openclaw::run_openclaw_migration(config_path, dry_run, &cp, &registry, &inst_dir)?;
 
     println!("{report}");
 

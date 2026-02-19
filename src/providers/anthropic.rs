@@ -102,10 +102,7 @@ impl Provider for AnthropicProvider {
             // The oauth-2025-04-20 beta flag is required for the API to accept OAuth tokens.
             request = request
                 .header("Authorization", format!("Bearer {credential}"))
-                .header(
-                    "anthropic-beta",
-                    "claude-code-20250219,oauth-2025-04-20",
-                )
+                .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
                 .header("user-agent", "claude-cli/2.1.2 (external, cli)")
                 .header("x-app", "cli")
                 .header("anthropic-dangerous-direct-browser-access", "true");
@@ -175,10 +172,7 @@ impl Provider for AnthropicProvider {
         if Self::is_oauth_token(credential) {
             request = request
                 .header("Authorization", format!("Bearer {credential}"))
-                .header(
-                    "anthropic-beta",
-                    "claude-code-20250219,oauth-2025-04-20",
-                )
+                .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
                 .header("user-agent", "claude-cli/2.1.2 (external, cli)")
                 .header("x-app", "cli")
                 .header("anthropic-dangerous-direct-browser-access", "true");

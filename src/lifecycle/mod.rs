@@ -196,10 +196,7 @@ pub fn verify_pid_ownership(pid: u32, expected_instance_dir: &Path) -> Result<bo
     let environ_path = format!("/proc/{pid}/environ");
     match fs::read(&environ_path) {
         Ok(data) => {
-            let expected = format!(
-                "ZEROCLAW_HOME={}",
-                expected_instance_dir.to_string_lossy()
-            );
+            let expected = format!("ZEROCLAW_HOME={}", expected_instance_dir.to_string_lossy());
             // environ is null-separated key=value pairs
             for entry in data.split(|&b| b == 0) {
                 if let Ok(s) = std::str::from_utf8(entry) {
@@ -227,8 +224,7 @@ fn zeroclaw_bin() -> Result<PathBuf> {
         return Ok(PathBuf::from(bin));
     }
 
-    let current =
-        std::env::current_exe().context("Failed to resolve current executable path")?;
+    let current = std::env::current_exe().context("Failed to resolve current executable path")?;
     let parent = current
         .parent()
         .context("Current executable has no parent directory")?;
@@ -278,15 +274,22 @@ fn kill_child_best_effort(pid: u32) {
 }
 
 /// Stop a running instance. Caller must hold the lifecycle lock.
-fn stop_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Result<(), LifecycleError> {
-    let pid = read_pid(inst_dir)?
-        .ok_or_else(|| LifecycleError::NotRunning(instance.name.clone()))?;
+fn stop_inner(
+    registry: &Registry,
+    instance: &Instance,
+    inst_dir: &Path,
+) -> Result<(), LifecycleError> {
+    let pid =
+        read_pid(inst_dir)?.ok_or_else(|| LifecycleError::NotRunning(instance.name.clone()))?;
 
     if !is_pid_alive(pid) {
         tracing::info!("Process {pid} already dead, cleaning up");
         remove_pid(inst_dir)?;
         registry.update_status(&instance.id, "stopped")?;
-        println!("Instance '{}' was already stopped (stale PID cleaned)", instance.name);
+        println!(
+            "Instance '{}' was already stopped (stale PID cleaned)",
+            instance.name
+        );
         return Ok(());
     }
 
@@ -350,7 +353,11 @@ fn stop_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Resu
 }
 
 /// Start an instance by spawning `zeroclaw daemon`. Caller must hold the lifecycle lock.
-fn start_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Result<(), LifecycleError> {
+fn start_inner(
+    registry: &Registry,
+    instance: &Instance,
+    inst_dir: &Path,
+) -> Result<(), LifecycleError> {
     // Check for existing PID
     if let Some(pid) = read_pid(inst_dir)? {
         if is_pid_alive(pid) {
@@ -377,7 +384,9 @@ fn start_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Res
         .append(true)
         .open(log_path(inst_dir))
         .context("Failed to open log file")?;
-    let log_file_err = log_file.try_clone().context("Failed to clone log file handle")?;
+    let log_file_err = log_file
+        .try_clone()
+        .context("Failed to clone log file handle")?;
 
     let mut child = Command::new(&bin)
         .arg("daemon")
@@ -388,12 +397,7 @@ fn start_inner(registry: &Registry, instance: &Instance, inst_dir: &Path) -> Res
         .stderr(log_file_err)
         .process_group(0) // Detach from parent's process group
         .spawn()
-        .with_context(|| {
-            format!(
-                "Failed to spawn zeroclaw daemon for '{}'",
-                instance.name
-            )
-        })?;
+        .with_context(|| format!("Failed to spawn zeroclaw daemon for '{}'", instance.name))?;
 
     let pid = child.id();
 
@@ -702,9 +706,10 @@ mod tests {
         let _lock1 = acquire_lifecycle_lock(tmp.path()).unwrap();
         let result = acquire_lifecycle_lock(tmp.path());
         assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("Lifecycle lock held")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Lifecycle lock held"));
     }
 
     #[test]

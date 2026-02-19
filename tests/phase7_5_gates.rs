@@ -25,14 +25,7 @@ fn setup_instance(name: &str, port: u16, config_toml: &str) -> (TempDir, PathBuf
     fs::write(&config_path, config_toml).unwrap();
 
     registry
-        .create_instance(
-            &id,
-            name,
-            port,
-            config_path.to_str().unwrap(),
-            None,
-            None,
-        )
+        .create_instance(&id, name, port, config_path.to_str().unwrap(), None, None)
         .unwrap();
 
     (tmp, db_path, id, inst_dir)
@@ -280,7 +273,10 @@ async fn gate1_details_missing_config_reports_error() -> Result<()> {
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await?;
-    assert!(body["config"].is_null(), "config should be null when file missing");
+    assert!(
+        body["config"].is_null(),
+        "config should be null when file missing"
+    );
     assert!(
         body["config_error"].as_str().is_some(),
         "Should have config_error"
@@ -346,9 +342,7 @@ async fn gate2_tasks_ordering_and_pagination() -> Result<()> {
 
     // Request limit=3, should get events 5,4,3 (descending)
     let resp = client
-        .get(format!(
-            "{base_url}/api/instances/task-order/tasks?limit=3"
-        ))
+        .get(format!("{base_url}/api/instances/task-order/tasks?limit=3"))
         .send()
         .await?;
     assert_eq!(resp.status(), 200);
@@ -364,9 +358,7 @@ async fn gate2_tasks_ordering_and_pagination() -> Result<()> {
 
     // Stability: same query returns same results
     let resp2 = client
-        .get(format!(
-            "{base_url}/api/instances/task-order/tasks?limit=3"
-        ))
+        .get(format!("{base_url}/api/instances/task-order/tasks?limit=3"))
         .send()
         .await?;
     let body2: serde_json::Value = resp2.json().await?;
@@ -610,9 +602,7 @@ async fn gate4_logs_invalid_mode() -> Result<()> {
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!(
-            "{base_url}/api/instances/log-bad/logs?mode=bogus"
-        ))
+        .get(format!("{base_url}/api/instances/log-bad/logs?mode=bogus"))
         .send()
         .await?;
     assert_eq!(resp.status(), 400);
@@ -635,15 +625,18 @@ async fn gate4_logs_download() -> Result<()> {
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!(
-            "{base_url}/api/instances/log-dl/logs/download"
-        ))
+        .get(format!("{base_url}/api/instances/log-dl/logs/download"))
         .send()
         .await?;
     assert_eq!(resp.status(), 200);
 
     // Content-Type should be text/plain
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(ct.contains("text/plain"));
 
     // Content-Disposition should be attachment
@@ -681,7 +674,10 @@ async fn gate4_logs_download_empty_file() -> Result<()> {
         .await?;
     assert_eq!(resp.status(), 200);
     let body = resp.text().await?;
-    assert!(body.is_empty(), "Download of missing log should return empty body");
+    assert!(
+        body.is_empty(),
+        "Download of missing log should return empty body"
+    );
 
     let _ = shutdown.send(true);
     Ok(())
@@ -717,7 +713,10 @@ async fn gate4_logs_download_concatenates_rotated_and_current() -> Result<()> {
     let body = resp.text().await?;
     // Should be rotated first (chronological), then current
     let expected = format!("{rotated_content}{current_content}");
-    assert_eq!(body, expected, "Download should concatenate rotated + current in order");
+    assert_eq!(
+        body, expected,
+        "Download should concatenate rotated + current in order"
+    );
 
     let _ = shutdown.send(true);
     Ok(())
@@ -739,9 +738,7 @@ async fn gate4_logs_download_rotated_only() -> Result<()> {
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!(
-            "{base_url}/api/instances/log-dl-rot/logs/download"
-        ))
+        .get(format!("{base_url}/api/instances/log-dl-rot/logs/download"))
         .send()
         .await?;
     assert_eq!(resp.status(), 200);
@@ -799,8 +796,7 @@ async fn gate5_null_secrets_stay_null() -> Result<()> {
     let minimal_config = r#"
 default_temperature = 0.7
 "#;
-    let (_tmp, db_path, _id, _inst_dir) =
-        setup_instance("null-secrets", 18964, minimal_config);
+    let (_tmp, db_path, _id, _inst_dir) = setup_instance("null-secrets", 18964, minimal_config);
 
     let (base_url, shutdown) = start_test_server(db_path).await;
     let client = reqwest::Client::new();
@@ -840,14 +836,15 @@ fn unique_active_name_index_prevents_duplicates() -> Result<()> {
     assert!(result.is_err(), "Duplicate active name should be rejected");
 
     // But archived + new active should be fine
-    registry
-        .conn()
-        .execute(
-            "UPDATE instances SET archived_at = datetime('now') WHERE id = 'id-1'",
-            [],
-        )?;
+    registry.conn().execute(
+        "UPDATE instances SET archived_at = datetime('now') WHERE id = 'id-1'",
+        [],
+    )?;
     let result = registry.create_instance("id-3", "agent", 18803, "/c3.toml", None, None);
-    assert!(result.is_ok(), "New active instance with archived duplicate name should succeed");
+    assert!(
+        result.is_ok(),
+        "New active instance with archived duplicate name should succeed"
+    );
 
     Ok(())
 }

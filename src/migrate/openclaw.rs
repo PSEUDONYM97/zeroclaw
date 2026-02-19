@@ -175,10 +175,7 @@ pub fn run_openclaw_migration(
     registry: &Registry,
     instances_dir: &Path,
 ) -> Result<MigrationReport> {
-    let source_path = config_path
-        .to_str()
-        .unwrap_or("(non-utf8)")
-        .to_string();
+    let source_path = config_path.to_str().unwrap_or("(non-utf8)").to_string();
     let openclaw_dir = config_path
         .parent()
         .context("Config path has no parent directory")?;
@@ -194,7 +191,11 @@ pub fn run_openclaw_migration(
 
     // Check for unsupported top-level fields
     collect_unsupported_warnings(&config.extra, "config", &mut warnings);
-    collect_unsupported_warnings(&config.agents.defaults.extra, "agents.defaults", &mut warnings);
+    collect_unsupported_warnings(
+        &config.agents.defaults.extra,
+        "agents.defaults",
+        &mut warnings,
+    );
     if let Some(ref channels) = config.channels {
         if let Some(ref tg) = channels.telegram {
             collect_telegram_channel_warnings(&tg.extra, &mut warnings);
@@ -213,10 +214,7 @@ pub fn run_openclaw_migration(
     // Check name collisions (active + archived)
     for a in &config.agents.list {
         if let Some(ex) = registry.get_instance_by_name(&a.id)? {
-            errors.push(format!(
-                "Active instance '{}' exists (id: {})",
-                a.id, ex.id
-            ));
+            errors.push(format!("Active instance '{}' exists (id: {})", a.id, ex.id));
         }
         if let Some(arc) = registry.find_archived_instance_by_name(&a.id)? {
             errors.push(format!(
@@ -308,11 +306,7 @@ pub fn run_openclaw_migration(
             instance_id: s.id.clone(),
             instance_name: s.name.clone(),
             port: s.port,
-            workspace_path: r
-                .workspace_path
-                .as_deref()
-                .unwrap_or("(none)")
-                .to_string(),
+            workspace_path: r.workspace_path.as_deref().unwrap_or("(none)").to_string(),
             channels: if r.telegram.is_some() {
                 vec!["telegram".into()]
             } else {
@@ -402,12 +396,10 @@ fn resolve_agent(
     warnings: &mut Vec<String>,
 ) -> Result<ResolvedAgent> {
     // Model resolution
-    let model_str = agent.model.as_deref().or_else(|| {
-        defaults
-            .model
-            .as_ref()
-            .and_then(|m| m.primary.as_deref())
-    });
+    let model_str = agent
+        .model
+        .as_deref()
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary.as_deref()));
 
     let (provider, model) = if let Some(m) = model_str {
         if let Some(slash_pos) = m.find('/') {
@@ -446,13 +438,7 @@ fn resolve_agent(
     let api_key = resolve_api_key(agent, openclaw_dir, provider.as_deref(), secrets, warnings);
 
     // Telegram binding resolution
-    let telegram = resolve_telegram_binding(
-        &agent.id,
-        bindings,
-        channels,
-        secrets,
-        warnings,
-    );
+    let telegram = resolve_telegram_binding(&agent.id, bindings, channels, secrets, warnings);
 
     // Port allocation
     let port = registry
@@ -517,10 +503,7 @@ fn resolve_workspace(
                 agent_id,
                 resolved.display()
             ));
-            (
-                Some(resolved.to_string_lossy().to_string()),
-                Some(resolved),
-            )
+            (Some(resolved.to_string_lossy().to_string()), Some(resolved))
         }
     }
 }
@@ -602,10 +585,7 @@ fn resolve_telegram_binding(
 ) -> Option<ResolvedTelegram> {
     let binding = bindings.iter().find(|b| {
         b.agent_id.as_deref() == Some(agent_id)
-            && b.match_
-                .as_ref()
-                .and_then(|m| m.channel.as_deref())
-                == Some("telegram")
+            && b.match_.as_ref().and_then(|m| m.channel.as_deref()) == Some("telegram")
     })?;
 
     let account_name = binding
@@ -761,10 +741,7 @@ fn collect_unsupported_warnings(
     }
 }
 
-fn collect_telegram_channel_warnings(
-    extra: &HashMap<String, Value>,
-    warnings: &mut Vec<String>,
-) {
+fn collect_telegram_channel_warnings(extra: &HashMap<String, Value>, warnings: &mut Vec<String>) {
     let known: &[(&str, &str)] = &[
         ("streamMode", "Telegram stream mode is not migrated"),
         ("dmPolicy", "Telegram DM policy is not migrated"),
@@ -926,10 +903,10 @@ fn rollback_committed(
     for &idx in committed_indices.iter().rev() {
         let s = &staged[idx];
         // Delete from DB (best-effort)
-        if let Err(e) = registry
-            .conn()
-            .execute("DELETE FROM instances WHERE id = ?1", rusqlite::params![s.id])
-        {
+        if let Err(e) = registry.conn().execute(
+            "DELETE FROM instances WHERE id = ?1",
+            rusqlite::params![s.id],
+        ) {
             errors.push(format!("DB rollback failed for {}: {e}", s.id));
         }
         // Delete from FS (best-effort)

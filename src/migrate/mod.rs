@@ -31,11 +31,7 @@ pub fn acquire_migration_lock(cp_dir: &Path) -> Result<std::fs::File> {
 /// Assumes caller holds the migration lock.
 /// Returns Ok(true) if all reconciliation succeeded (safe to proceed).
 /// Returns Ok(false) if any pending manifests remain unresolved.
-pub fn reconcile_inner(
-    cp_dir: &Path,
-    registry: &Registry,
-    instances_dir: &Path,
-) -> Result<bool> {
+pub fn reconcile_inner(cp_dir: &Path, registry: &Registry, instances_dir: &Path) -> Result<bool> {
     // Phase 1: clean done bookmarks
     for entry in glob_manifests(cp_dir, "migration-done-") {
         if let Err(e) = std::fs::remove_file(&entry) {
@@ -102,9 +98,7 @@ fn process_pending_manifest(
             actual_idir.display()
         );
         quarantine_manifest(path, cp_dir);
-        anyhow::bail!(
-            "Manifest instances_dir mismatch (quarantined for manual inspection)"
-        );
+        anyhow::bail!("Manifest instances_dir mismatch (quarantined for manual inspection)");
     }
 
     let run_id = &manifest.run_id;
@@ -185,10 +179,7 @@ fn process_pending_manifest(
 fn quarantine_manifest(path: &Path, cp_dir: &Path) {
     let quarantine = cp_dir.join("quarantine");
     let _ = std::fs::create_dir_all(&quarantine);
-    let fname = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let fname = path.file_name().unwrap_or_default().to_string_lossy();
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f");
     let suffix = &uuid::Uuid::new_v4().to_string()[..8];
     let dest = quarantine.join(format!("{fname}.{ts}-{suffix}"));

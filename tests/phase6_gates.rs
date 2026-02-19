@@ -36,14 +36,7 @@ require_pairing = true
     .unwrap();
 
     registry
-        .create_instance(
-            &id,
-            name,
-            port,
-            config_path.to_str().unwrap(),
-            None,
-            None,
-        )
+        .create_instance(&id, name, port, config_path.to_str().unwrap(), None, None)
         .unwrap();
 
     (tmp, registry, id, inst_dir)
@@ -142,7 +135,10 @@ fn gate4_stale_pid_cleared() -> Result<()> {
 
     // If spawn succeeded, the pidfile should contain a NEW pid (not the stale one)
     if result.is_ok() {
-        assert!(pid_path.exists(), "PID file should exist after successful start");
+        assert!(
+            pid_path.exists(),
+            "PID file should exist after successful start"
+        );
         let current_pid: u32 = fs::read_to_string(&pid_path)?.trim().parse()?;
         assert_ne!(
             current_pid, stale_pid,
@@ -152,7 +148,9 @@ fn gate4_stale_pid_cleared() -> Result<()> {
         let _ = lifecycle::stop_instance(&registry, "stale");
         if pid_path.exists() {
             // Fallback: direct kill if stop failed (e.g., ownership check on fake binary)
-            unsafe { libc::kill(current_pid as libc::pid_t, libc::SIGKILL); }
+            unsafe {
+                libc::kill(current_pid as libc::pid_t, libc::SIGKILL);
+            }
             let _ = fs::remove_file(&pid_path);
         }
     }
@@ -282,11 +280,17 @@ fn gate9_nonexistent_instance_error() -> Result<()> {
 
     let result = lifecycle::start_instance(&registry, "ghost");
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("No instance named"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("No instance named"));
 
     let result = lifecycle::stop_instance(&registry, "ghost");
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("No instance named"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("No instance named"));
 
     Ok(())
 }
@@ -308,14 +312,7 @@ fn gate10_fleet_status_multiple_instances() -> Result<()> {
         fs::create_dir_all(&inst_dir)?;
         let config_path = inst_dir.join("config.toml");
         fs::write(&config_path, "default_temperature = 0.7\n")?;
-        registry.create_instance(
-            &id,
-            name,
-            *port,
-            config_path.to_str().unwrap(),
-            None,
-            None,
-        )?;
+        registry.create_instance(&id, name, *port, config_path.to_str().unwrap(), None, None)?;
     }
 
     lifecycle::show_status(&registry, None)?;
@@ -442,7 +439,9 @@ fn gate13_rollback_kills_child_on_write_pid_failure() {
                             orphan_found = true;
                             // Kill it so we don't leak even if assertion fails
                             if let Ok(pid) = name.parse::<i32>() {
-                                unsafe { libc::kill(pid, libc::SIGKILL); }
+                                unsafe {
+                                    libc::kill(pid, libc::SIGKILL);
+                                }
                             }
                         }
                     }

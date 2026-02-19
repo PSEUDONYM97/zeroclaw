@@ -80,11 +80,7 @@ impl fmt::Display for MigrationReport {
             writeln!(
                 f,
                 "Instances {} ({}):",
-                if self.dry_run {
-                    "to create"
-                } else {
-                    "created"
-                },
+                if self.dry_run { "to create" } else { "created" },
                 self.created.len()
             )?;
             for c in &self.created {
