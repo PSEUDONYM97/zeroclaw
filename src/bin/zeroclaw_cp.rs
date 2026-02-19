@@ -294,10 +294,12 @@ async fn run_server() -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(18800);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+    let bind_addr = std::env::var("ZEROCLAW_CP_BIND")
+        .unwrap_or_else(|_| "127.0.0.1".to_string());
+    let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
         .await
-        .with_context(|| format!("Failed to bind to port {port}"))?;
-    println!("Listening on http://127.0.0.1:{port}");
+        .with_context(|| format!("Failed to bind to {bind_addr}:{port}"))?;
+    println!("Listening on http://{bind_addr}:{port}");
 
     // Shutdown coordination
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
