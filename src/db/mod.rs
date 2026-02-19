@@ -62,6 +62,26 @@ pub struct MessageEvent {
     pub created_at: String,
 }
 
+/// Filter parameters for querying messages.
+pub struct MessageFilters {
+    pub correlation_id: Option<String>,
+    pub from_instance: Option<String>,
+    pub to_instance: Option<String>,
+    pub message_type: Option<String>,
+    pub status: Option<String>,
+    pub after: Option<String>,
+    pub before: Option<String>,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+/// Direction filter for per-instance message queries.
+pub enum MessageDirection {
+    In,
+    Out,
+    All,
+}
+
 /// Represents an agent lifecycle/task event.
 #[derive(Debug, Clone)]
 pub struct AgentEvent {
@@ -302,6 +322,33 @@ impl Registry {
             );
             CREATE INDEX IF NOT EXISTS idx_message_events_msg
                 ON message_events(message_id);",
+        )?;
+
+        // Phase 10.2: additional indexes for observability queries
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_from_status
+                ON messages(from_instance, status);
+            CREATE INDEX IF NOT EXISTS idx_messages_created_at
+                ON messages(created_at);
+            CREATE INDEX IF NOT EXISTS idx_messages_status
+                ON messages(status);
+            CREATE INDEX IF NOT EXISTS idx_message_events_msg_created
+                ON message_events(message_id, created_at);",
+        )?;
+
+        // Phase 10.2: append-only triggers for message_events
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS prevent_message_events_update
+            BEFORE UPDATE ON message_events
+            BEGIN
+                SELECT RAISE(ABORT, 'message_events is append-only: UPDATE not allowed');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS prevent_message_events_delete
+            BEFORE DELETE ON message_events
+            BEGIN
+                SELECT RAISE(ABORT, 'message_events is append-only: DELETE not allowed');
+            END;",
         )?;
 
         Ok(())
@@ -963,6 +1010,351 @@ impl Registry {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    // ── Messaging observability (Phase 10.2) ──────────────────
+
+    /// Get all events for a message, ordered chronologically.
+    pub fn get_message_events(&self, message_id: &str) -> Result<Vec<MessageEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, message_id, event_type, detail, created_at
+             FROM message_events WHERE message_id = ?1
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![message_id], |row| {
+            Ok(MessageEvent {
+                id: row.get(0)?,
+                message_id: row.get(1)?,
+                event_type: row.get(2)?,
+                detail: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    /// List messages with dynamic filters. Returns (messages, total_count).
+    pub fn list_messages(&self, filters: &MessageFilters) -> Result<(Vec<Message>, usize)> {
+        let mut where_clauses: Vec<String> = Vec::new();
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1u32;
+
+        if let Some(ref cid) = filters.correlation_id {
+            where_clauses.push(format!("correlation_id = ?{param_idx}"));
+            bind_values.push(Box::new(cid.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref from) = filters.from_instance {
+            where_clauses.push(format!("from_instance = ?{param_idx}"));
+            bind_values.push(Box::new(from.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref to) = filters.to_instance {
+            where_clauses.push(format!("to_instance = ?{param_idx}"));
+            bind_values.push(Box::new(to.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref mt) = filters.message_type {
+            where_clauses.push(format!("message_type = ?{param_idx}"));
+            bind_values.push(Box::new(mt.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref status) = filters.status {
+            where_clauses.push(format!("status = ?{param_idx}"));
+            bind_values.push(Box::new(status.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref after) = filters.after {
+            where_clauses.push(format!("created_at > ?{param_idx}"));
+            bind_values.push(Box::new(after.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref before) = filters.before {
+            where_clauses.push(format!("created_at < ?{param_idx}"));
+            bind_values.push(Box::new(before.clone()));
+            param_idx += 1;
+        }
+
+        let where_sql = if where_clauses.is_empty() {
+            "1=1".to_string()
+        } else {
+            where_clauses.join(" AND ")
+        };
+
+        // Count total
+        let count_sql = format!("SELECT COUNT(*) FROM messages WHERE {where_sql}");
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let total: usize = self
+            .conn
+            .query_row(&count_sql, params_ref.as_slice(), |row| {
+                row.get::<_, i64>(0).map(|v| v as usize)
+            })?;
+
+        // Query with pagination
+        let query_sql = format!(
+            "SELECT id, from_instance, to_instance, message_type, payload, correlation_id, \
+             idempotency_key, hop_count, status, retry_count, max_retries, next_attempt_at, \
+             lease_expires_at, expires_at, created_at, updated_at \
+             FROM messages WHERE {where_sql} \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT ?{param_idx} OFFSET ?{}",
+            param_idx + 1
+        );
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = bind_values;
+        all_params.push(Box::new(filters.limit as i64));
+        all_params.push(Box::new(filters.offset as i64));
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&query_sql)?;
+        let rows = stmt.query_map(params_ref.as_slice(), Self::row_to_message)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok((messages, total))
+    }
+
+    /// List messages for a specific instance with direction filter.
+    /// Returns (messages, total_count).
+    pub fn list_messages_for_instance(
+        &self,
+        name: &str,
+        direction: MessageDirection,
+        filters: &MessageFilters,
+    ) -> Result<(Vec<Message>, usize)> {
+        let mut where_clauses: Vec<String> = Vec::new();
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1u32;
+
+        // Direction clause
+        match direction {
+            MessageDirection::In => {
+                where_clauses.push(format!("to_instance = ?{param_idx}"));
+                bind_values.push(Box::new(name.to_string()));
+                param_idx += 1;
+            }
+            MessageDirection::Out => {
+                where_clauses.push(format!("from_instance = ?{param_idx}"));
+                bind_values.push(Box::new(name.to_string()));
+                param_idx += 1;
+            }
+            MessageDirection::All => {
+                where_clauses.push(format!(
+                    "(from_instance = ?{param_idx} OR to_instance = ?{})",
+                    param_idx + 1
+                ));
+                bind_values.push(Box::new(name.to_string()));
+                bind_values.push(Box::new(name.to_string()));
+                param_idx += 2;
+            }
+        }
+
+        if let Some(ref status) = filters.status {
+            where_clauses.push(format!("status = ?{param_idx}"));
+            bind_values.push(Box::new(status.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref mt) = filters.message_type {
+            where_clauses.push(format!("message_type = ?{param_idx}"));
+            bind_values.push(Box::new(mt.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref after) = filters.after {
+            where_clauses.push(format!("created_at > ?{param_idx}"));
+            bind_values.push(Box::new(after.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref before) = filters.before {
+            where_clauses.push(format!("created_at < ?{param_idx}"));
+            bind_values.push(Box::new(before.clone()));
+            param_idx += 1;
+        }
+
+        let where_sql = where_clauses.join(" AND ");
+
+        // Count total
+        let count_sql = format!("SELECT COUNT(*) FROM messages WHERE {where_sql}");
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let total: usize = self
+            .conn
+            .query_row(&count_sql, params_ref.as_slice(), |row| {
+                row.get::<_, i64>(0).map(|v| v as usize)
+            })?;
+
+        // Query with pagination
+        let query_sql = format!(
+            "SELECT id, from_instance, to_instance, message_type, payload, correlation_id, \
+             idempotency_key, hop_count, status, retry_count, max_retries, next_attempt_at, \
+             lease_expires_at, expires_at, created_at, updated_at \
+             FROM messages WHERE {where_sql} \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT ?{param_idx} OFFSET ?{}",
+            param_idx + 1
+        );
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = bind_values;
+        all_params.push(Box::new(filters.limit as i64));
+        all_params.push(Box::new(filters.offset as i64));
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&query_sql)?;
+        let rows = stmt.query_map(params_ref.as_slice(), Self::row_to_message)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok((messages, total))
+    }
+
+    /// List dead-letter messages with optional filters.
+    /// Sorts by updated_at DESC (most recently dead-lettered first).
+    pub fn list_dead_letter_messages(
+        &self,
+        filters: &MessageFilters,
+    ) -> Result<(Vec<Message>, usize)> {
+        let mut where_clauses = vec!["status = 'dead_letter'".to_string()];
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1u32;
+
+        if let Some(ref from) = filters.from_instance {
+            where_clauses.push(format!("from_instance = ?{param_idx}"));
+            bind_values.push(Box::new(from.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref to) = filters.to_instance {
+            where_clauses.push(format!("to_instance = ?{param_idx}"));
+            bind_values.push(Box::new(to.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref after) = filters.after {
+            where_clauses.push(format!("updated_at > ?{param_idx}"));
+            bind_values.push(Box::new(after.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref before) = filters.before {
+            where_clauses.push(format!("updated_at < ?{param_idx}"));
+            bind_values.push(Box::new(before.clone()));
+            param_idx += 1;
+        }
+
+        let where_sql = where_clauses.join(" AND ");
+
+        // Count total
+        let count_sql = format!("SELECT COUNT(*) FROM messages WHERE {where_sql}");
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let total: usize = self
+            .conn
+            .query_row(&count_sql, params_ref.as_slice(), |row| {
+                row.get::<_, i64>(0).map(|v| v as usize)
+            })?;
+
+        // Query with pagination
+        let query_sql = format!(
+            "SELECT id, from_instance, to_instance, message_type, payload, correlation_id, \
+             idempotency_key, hop_count, status, retry_count, max_retries, next_attempt_at, \
+             lease_expires_at, expires_at, created_at, updated_at \
+             FROM messages WHERE {where_sql} \
+             ORDER BY updated_at DESC, id DESC \
+             LIMIT ?{param_idx} OFFSET ?{}",
+            param_idx + 1
+        );
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = bind_values;
+        all_params.push(Box::new(filters.limit as i64));
+        all_params.push(Box::new(filters.offset as i64));
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&query_sql)?;
+        let rows = stmt.query_map(params_ref.as_slice(), Self::row_to_message)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok((messages, total))
+    }
+
+    /// Replay a dead-letter message: reset to queued with fresh TTL.
+    /// Wrapped in a transaction. Returns the updated message.
+    pub fn replay_message(&self, id: &str) -> Result<Message> {
+        self.conn
+            .execute_batch("BEGIN")
+            .context("Failed to begin replay transaction")?;
+
+        let result = (|| -> Result<Message> {
+            // Verify message exists and is dead_letter
+            let msg = self
+                .get_message(id)?
+                .ok_or_else(|| anyhow::anyhow!("Message not found: {id}"))?;
+
+            if msg.status != "dead_letter" {
+                anyhow::bail!(
+                    "Message {id} has status '{}', expected 'dead_letter'",
+                    msg.status
+                );
+            }
+
+            // Compute new TTL from original expires_at - created_at
+            let fmt = "%Y-%m-%d %H:%M:%S";
+            let ttl_secs = match (
+                chrono::NaiveDateTime::parse_from_str(&msg.expires_at, fmt),
+                chrono::NaiveDateTime::parse_from_str(&msg.created_at, fmt),
+            ) {
+                (Ok(exp), Ok(cre)) => {
+                    let diff = (exp - cre).num_seconds();
+                    diff.max(300).min(86400) // clamp 5m..24h
+                }
+                _ => 3600, // fallback: 1 hour
+            };
+
+            let now = chrono::Utc::now();
+            let now_str = now.format(fmt).to_string();
+            let new_expires = (now + chrono::Duration::seconds(ttl_secs))
+                .format(fmt)
+                .to_string();
+
+            // Reset message fields
+            self.conn.execute(
+                "UPDATE messages SET status = 'queued', retry_count = 0, \
+                 next_attempt_at = NULL, lease_expires_at = NULL, \
+                 expires_at = ?1, updated_at = ?2 WHERE id = ?3",
+                params![new_expires, now_str, id],
+            )?;
+
+            // Append replay events
+            self.conn.execute(
+                "INSERT INTO message_events (message_id, event_type, detail) VALUES (?1, ?2, ?3)",
+                params![id, "replayed", "manually replayed via API"],
+            )?;
+            self.conn.execute(
+                "INSERT INTO message_events (message_id, event_type, detail) VALUES (?1, ?2, ?3)",
+                params![id, "queued", "status reset to queued after replay"],
+            )?;
+
+            Ok(self
+                .get_message(id)?
+                .ok_or_else(|| anyhow::anyhow!("Message {id} not found after replay"))?)
+        })();
+
+        match result {
+            Ok(msg) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .context("Failed to commit replay transaction")?;
+                Ok(msg)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {

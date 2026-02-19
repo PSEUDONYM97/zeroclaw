@@ -140,14 +140,34 @@ pub fn build_router(state: CpState) -> Router {
             get(messaging::handle_list_rules).post(messaging::handle_create_rule),
         )
         .route("/routing-rules/:id", delete(messaging::handle_delete_rule))
-        .route("/messages", post(messaging::handle_send_message))
         .route(
-            "/instances/:name/messages/pending",
-            get(messaging::handle_receive_message),
+            "/messages",
+            get(messaging::handle_list_messages).post(messaging::handle_send_message),
+        )
+        .route(
+            "/messages/dead-letter",
+            get(messaging::handle_list_dead_letter),
+        )
+        .route("/messages/:id", get(messaging::handle_get_message))
+        .route(
+            "/messages/:id/events",
+            get(messaging::handle_get_message_events),
+        )
+        .route(
+            "/messages/:id/replay",
+            post(messaging::handle_replay_message),
         )
         .route(
             "/messages/:id/acknowledge",
             post(messaging::handle_acknowledge_message),
+        )
+        .route(
+            "/instances/:name/messages",
+            get(messaging::handle_list_instance_messages),
+        )
+        .route(
+            "/instances/:name/messages/pending",
+            get(messaging::handle_receive_message),
         )
         .fallback(handle_api_fallback);
 
