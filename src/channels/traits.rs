@@ -17,7 +17,7 @@ pub trait Channel: Send + Sync {
     fn name(&self) -> &str;
 
     /// Send a message through this channel
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()>;
+    async fn send(&self, message: &str, reply_to: &ChannelMessage) -> anyhow::Result<()>;
 
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;

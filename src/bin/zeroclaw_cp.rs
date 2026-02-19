@@ -294,8 +294,7 @@ async fn run_server() -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(18800);
-    let bind_addr = std::env::var("ZEROCLAW_CP_BIND")
-        .unwrap_or_else(|_| "127.0.0.1".to_string());
+    let bind_addr = std::env::var("ZEROCLAW_CP_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
     let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
         .await
         .with_context(|| format!("Failed to bind to {bind_addr}:{port}"))?;
@@ -305,8 +304,16 @@ async fn run_server() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Spawn supervisor
-    let supervisor_handle =
-        tokio::spawn(cp::supervisor::run_supervisor(db_path.clone(), shutdown_rx));
+    let supervisor_handle = tokio::spawn(cp::supervisor::run_supervisor(
+        db_path.clone(),
+        shutdown_rx.clone(),
+    ));
+
+    // Spawn delivery worker
+    let delivery_handle = tokio::spawn(cp::messaging::run_delivery_worker(
+        db_path.clone(),
+        shutdown_rx,
+    ));
 
     // Build router
     let state = cp::server::CpState { db_path };
@@ -320,9 +327,10 @@ async fn run_server() -> Result<()> {
         .await
         .context("Server error")?;
 
-    // Signal supervisor to stop
+    // Signal supervisor and delivery worker to stop
     let _ = shutdown_tx.send(true);
     let _ = supervisor_handle.await;
+    let _ = delivery_handle.await;
 
     println!("Shut down.");
     Ok(())

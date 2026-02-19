@@ -362,7 +362,8 @@ impl Channel for EmailChannel {
         "email"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> Result<()> {
+    async fn send(&self, message: &str, reply_to: &ChannelMessage) -> Result<()> {
+        let recipient = &reply_to.sender;
         let (subject, body) = if message.starts_with("Subject: ") {
             if let Some(pos) = message.find('\n') {
                 (&message[9..pos], message[pos + 1..].trim())

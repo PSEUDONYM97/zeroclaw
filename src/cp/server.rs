@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -15,6 +15,7 @@ use tokio_util::io::ReaderStream;
 use crate::cp::masking::{
     collect_key_paths, diff_json, mask_config_secrets, preserve_masked_secrets,
 };
+use crate::cp::messaging;
 use crate::db::Registry;
 use crate::lifecycle;
 use crate::lifecycle::LifecycleError;
@@ -134,6 +135,20 @@ pub fn build_router(state: CpState) -> Router {
             post(handle_config_validate),
         )
         .route("/instances/:name/config/diff", post(handle_config_diff))
+        .route(
+            "/routing-rules",
+            get(messaging::handle_list_rules).post(messaging::handle_create_rule),
+        )
+        .route("/routing-rules/:id", delete(messaging::handle_delete_rule))
+        .route("/messages", post(messaging::handle_send_message))
+        .route(
+            "/instances/:name/messages/pending",
+            get(messaging::handle_receive_message),
+        )
+        .route(
+            "/messages/:id/acknowledge",
+            post(messaging::handle_acknowledge_message),
+        )
         .fallback(handle_api_fallback);
 
     Router::new()

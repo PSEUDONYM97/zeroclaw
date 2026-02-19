@@ -127,7 +127,8 @@ impl Channel for DiscordChannel {
         "discord"
     }
 
-    async fn send(&self, message: &str, channel_id: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &str, reply_to: &ChannelMessage) -> anyhow::Result<()> {
+        let channel_id = &reply_to.sender;
         let chunks = split_message_for_discord(message);
 
         for (i, chunk) in chunks.iter().enumerate() {

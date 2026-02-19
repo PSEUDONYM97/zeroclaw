@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod cp_relay;
 pub mod discord;
 pub mod email_channel;
 pub mod imessage;
@@ -10,6 +11,7 @@ pub mod traits;
 pub mod whatsapp;
 
 pub use cli::CliChannel;
+pub use cp_relay::CpRelayChannel;
 pub use discord::DiscordChannel;
 pub use email_channel::EmailChannel;
 pub use imessage::IMessageChannel;
@@ -653,6 +655,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
+    if config.channels_config.cp_relay.is_some() {
+        if let Some(relay) = CpRelayChannel::from_env() {
+            channels.push(Arc::new(relay));
+        } else {
+            tracing::warn!(
+                "cp_relay configured but ZEROCLAW_INSTANCE_NAME not set; skipping CP relay channel"
+            );
+        }
+    }
+
     if channels.is_empty() {
         println!("No channels configured. Run `zeroclaw onboard` to set up channels.");
         return Ok(());
@@ -771,7 +783,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 // Find the channel that sent this message and reply
                 for ch in &channels {
                     if ch.name() == msg.channel {
-                        if let Err(e) = ch.send(&response, &msg.sender).await {
+                        if let Err(e) = ch.send(&response, &msg).await {
                             eprintln!("  ❌ Failed to reply on {}: {e}", ch.name());
                         }
                         break;
@@ -797,7 +809,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 );
                 for ch in &channels {
                     if ch.name() == msg.channel {
-                        let _ = ch.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
+                        let _ = ch.send(&format!("⚠️ Error: {e}"), &msg).await;
                         break;
                     }
                 }
@@ -817,7 +829,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                         let _ = ch
                             .send(
                                 "⚠️ Request timed out while waiting for the model. Please try again.",
-                                &msg.sender,
+                                &msg,
                             )
                             .await;
                         break;
@@ -1245,7 +1257,11 @@ mod tests {
             self.name
         }
 
-        async fn send(&self, _message: &str, _recipient: &str) -> anyhow::Result<()> {
+        async fn send(
+            &self,
+            _message: &str,
+            _reply_to: &traits::ChannelMessage,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 

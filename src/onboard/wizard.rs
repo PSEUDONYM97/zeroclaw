@@ -1118,6 +1118,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         whatsapp: None,
         email: None,
         irc: None,
+        cp_relay: None,
     };
 
     loop {

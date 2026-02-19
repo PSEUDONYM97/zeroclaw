@@ -694,6 +694,7 @@ pub struct ChannelsConfig {
     pub whatsapp: Option<WhatsAppConfig>,
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     pub irc: Option<IrcConfig>,
+    pub cp_relay: Option<CpRelayConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -709,8 +710,14 @@ impl Default for ChannelsConfig {
             whatsapp: None,
             email: None,
             irc: None,
+            cp_relay: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpRelayConfig {
+    pub cp_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1178,6 +1185,7 @@ mod tests {
                 whatsapp: None,
                 email: None,
                 irc: None,
+                cp_relay: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -1424,6 +1432,7 @@ default_temperature = 0.7
             whatsapp: None,
             email: None,
             irc: None,
+            cp_relay: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -1582,6 +1591,7 @@ channel_id = "C123"
             }),
             email: None,
             irc: None,
+            cp_relay: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

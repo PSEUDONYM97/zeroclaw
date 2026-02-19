@@ -138,7 +138,8 @@ impl Channel for WhatsAppChannel {
         "whatsapp"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &str, reply_to: &ChannelMessage) -> anyhow::Result<()> {
+        let recipient = &reply_to.sender;
         // WhatsApp Cloud API: POST to /v18.0/{phone_number_id}/messages
         let url = format!(
             "https://graph.facebook.com/v18.0/{}/messages",

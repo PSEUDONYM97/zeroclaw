@@ -95,7 +95,8 @@ impl Channel for IMessageChannel {
         "imessage"
     }
 
-    async fn send(&self, message: &str, target: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &str, reply_to: &ChannelMessage) -> anyhow::Result<()> {
+        let target = &reply_to.sender;
         // Defense-in-depth: validate target format before any interpolation
         if !is_valid_imessage_target(target) {
             anyhow::bail!(

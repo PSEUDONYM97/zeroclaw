@@ -645,17 +645,14 @@ async fn handle_whatsapp_message(
         {
             Ok(response) => {
                 // Send reply via WhatsApp
-                if let Err(e) = wa.send(&response, &msg.sender).await {
+                if let Err(e) = wa.send(&response, msg).await {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
                 }
             }
             Err(e) => {
                 tracing::error!("LLM error for WhatsApp message: {e:#}");
                 let _ = wa
-                    .send(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.sender,
-                    )
+                    .send("Sorry, I couldn't process your message right now.", msg)
                     .await;
             }
         }

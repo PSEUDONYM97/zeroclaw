@@ -393,6 +393,16 @@ fn start_inner(
         .arg("--port")
         .arg(instance.port.to_string())
         .env("ZEROCLAW_HOME", inst_dir.to_string_lossy().as_ref())
+        .env("ZEROCLAW_INSTANCE_NAME", &instance.name)
+        .env(
+            "ZEROCLAW_CP_URL",
+            std::env::var("ZEROCLAW_CP_URL").unwrap_or_else(|_| {
+                format!(
+                    "http://127.0.0.1:{}",
+                    std::env::var("ZEROCLAW_CP_PORT").unwrap_or_else(|_| "18800".to_string())
+                )
+            }),
+        )
         .stdout(log_file)
         .stderr(log_file_err)
         .process_group(0) // Detach from parent's process group

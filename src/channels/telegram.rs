@@ -369,7 +369,8 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
-    async fn send(&self, message: &str, chat_id: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &str, reply_to: &ChannelMessage) -> anyhow::Result<()> {
+        let chat_id = &reply_to.sender;
         let markdown_body = serde_json::json!({
             "chat_id": chat_id,
             "text": message,
