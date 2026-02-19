@@ -18,7 +18,7 @@ impl Channel for CliChannel {
         "cli"
     }
 
-    async fn send(&self, message: &str, _recipient: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &str, _reply_to: &ChannelMessage) -> anyhow::Result<()> {
         println!("{message}");
         Ok(())
     }
@@ -65,17 +65,27 @@ mod tests {
         assert_eq!(CliChannel::new().name(), "cli");
     }
 
+    fn dummy_msg() -> ChannelMessage {
+        ChannelMessage {
+            id: "test".into(),
+            sender: "user".into(),
+            content: "".into(),
+            channel: "cli".into(),
+            timestamp: 0,
+        }
+    }
+
     #[tokio::test]
     async fn cli_channel_send_does_not_panic() {
         let ch = CliChannel::new();
-        let result = ch.send("hello", "user").await;
+        let result = ch.send("hello", &dummy_msg()).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn cli_channel_send_empty_message() {
         let ch = CliChannel::new();
-        let result = ch.send("", "").await;
+        let result = ch.send("", &dummy_msg()).await;
         assert!(result.is_ok());
     }
 

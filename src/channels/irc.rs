@@ -343,7 +343,8 @@ impl Channel for IrcChannel {
         "irc"
     }
 
-    async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &str, reply_to: &ChannelMessage) -> anyhow::Result<()> {
+        let recipient = &reply_to.sender;
         let mut guard = self.writer.lock().await;
         let writer = guard
             .as_mut()

@@ -421,6 +421,55 @@ fn diff_recursive(
     }
 }
 
+// ── Payload secret redaction (Phase 10.1) ───────────────────────
+
+const REDACTED: &str = "***REDACTED***";
+
+/// Keys whose string values should be redacted in message payloads.
+const SECRET_KEY_PATTERNS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "token",
+    "secret",
+    "password",
+    "authorization",
+    "auth_token",
+    "access_token",
+    "private_key",
+    "credentials",
+];
+
+/// Scan a JSON payload for known secret patterns and replace string values with `***REDACTED***`.
+/// Checks JSON object keys (case-insensitive) against known secret-like patterns.
+pub fn redact_payload_secrets(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                let key_lower = key.to_lowercase();
+                let is_secret = SECRET_KEY_PATTERNS
+                    .iter()
+                    .any(|pattern| key_lower.contains(pattern));
+                if is_secret {
+                    if let Some(val) = map.get_mut(&key) {
+                        if val.is_string() {
+                            *val = Value::String(REDACTED.to_string());
+                        }
+                    }
+                } else if let Some(val) = map.get_mut(&key) {
+                    redact_payload_secrets(val);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                redact_payload_secrets(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Test helper: recursively check whether any string value in `json` exactly
 /// matches one of the provided `secrets`. Returns true if a leak is found.
 #[cfg(test)]

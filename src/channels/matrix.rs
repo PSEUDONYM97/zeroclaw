@@ -117,7 +117,7 @@ impl Channel for MatrixChannel {
         "matrix"
     }
 
-    async fn send(&self, message: &str, _target: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &str, _reply_to: &ChannelMessage) -> anyhow::Result<()> {
         let txn_id = format!("zc_{}", chrono::Utc::now().timestamp_millis());
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",

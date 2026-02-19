@@ -52,7 +52,8 @@ impl Channel for SlackChannel {
         "slack"
     }
 
-    async fn send(&self, message: &str, channel: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &str, reply_to: &ChannelMessage) -> anyhow::Result<()> {
+        let channel = &reply_to.sender;
         let body = serde_json::json!({
             "channel": channel,
             "text": message

@@ -2,6 +2,66 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
+// ── Messaging structs (Phase 10.1) ──────────────────────────────
+
+/// A routing rule that authorizes messages between two instances.
+#[derive(Debug, Clone)]
+pub struct RoutingRule {
+    pub id: String,
+    pub from_instance: String,
+    pub to_instance: String,
+    pub type_pattern: String,
+    pub max_retries: i64,
+    pub ttl_secs: i64,
+    pub auto_start: bool,
+    pub created_at: String,
+}
+
+/// A queued inter-agent message.
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub id: String,
+    pub from_instance: String,
+    pub to_instance: String,
+    pub message_type: String,
+    pub payload: String,
+    pub correlation_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub hop_count: i64,
+    pub status: String,
+    pub retry_count: i64,
+    pub max_retries: i64,
+    pub next_attempt_at: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub expires_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Parameters for creating a new message.
+pub struct NewMessage {
+    pub id: String,
+    pub from_instance: String,
+    pub to_instance: String,
+    pub message_type: String,
+    pub payload: String,
+    pub correlation_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub hop_count: i64,
+    pub max_retries: i64,
+    pub ttl_secs: i64,
+}
+
+/// An append-only audit event for a message.
+#[derive(Debug, Clone)]
+pub struct MessageEvent {
+    pub id: i64,
+    pub message_id: String,
+    pub event_type: String,
+    pub detail: Option<String>,
+    pub created_at: String,
+}
+
 /// Represents an agent lifecycle/task event.
 #[derive(Debug, Clone)]
 pub struct AgentEvent {
@@ -183,6 +243,65 @@ impl Registry {
             );
             CREATE INDEX IF NOT EXISTS idx_agent_usage_instance_created
                 ON agent_usage(instance_id, created_at DESC);",
+        )?;
+
+        // Phase 10.1: routing_rules table
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS routing_rules (
+                id TEXT PRIMARY KEY NOT NULL,
+                from_instance TEXT NOT NULL,
+                to_instance TEXT NOT NULL,
+                type_pattern TEXT NOT NULL,
+                max_retries INTEGER NOT NULL DEFAULT 5,
+                ttl_secs INTEGER NOT NULL DEFAULT 3600,
+                auto_start INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now'))
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_rules_tuple
+                ON routing_rules(from_instance, to_instance, type_pattern);",
+        )?;
+
+        // Phase 10.1: messages table
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY NOT NULL,
+                from_instance TEXT NOT NULL,
+                to_instance TEXT NOT NULL,
+                message_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                correlation_id TEXT,
+                idempotency_key TEXT,
+                hop_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'queued',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 5,
+                next_attempt_at TEXT,
+                lease_expires_at TEXT,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now'))
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_idempotency
+                ON messages(idempotency_key) WHERE idempotency_key IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_messages_to_status
+                ON messages(to_instance, status);
+            CREATE INDEX IF NOT EXISTS idx_messages_status_lease
+                ON messages(status, lease_expires_at);
+            CREATE INDEX IF NOT EXISTS idx_messages_correlation
+                ON messages(correlation_id) WHERE correlation_id IS NOT NULL;",
+        )?;
+
+        // Phase 10.1: message_events table (append-only audit log)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT NOT NULL REFERENCES messages(id),
+                event_type TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_events_msg
+                ON message_events(message_id);",
         )?;
 
         Ok(())
@@ -528,6 +647,345 @@ impl Registry {
             .context("Failed to query agent usage")
     }
 
+    // ── Messaging (Phase 10.1) ─────────────────────────────────
+
+    /// Create a routing rule. Returns the generated rule ID.
+    pub fn create_routing_rule(
+        &self,
+        from: &str,
+        to: &str,
+        type_pattern: &str,
+        max_retries: i64,
+        ttl_secs: i64,
+        auto_start: bool,
+    ) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO routing_rules (id, from_instance, to_instance, type_pattern, max_retries, ttl_secs, auto_start)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, from, to, type_pattern, max_retries, ttl_secs, auto_start as i64],
+        ).context("Failed to create routing rule")?;
+        Ok(id)
+    }
+
+    /// List all routing rules.
+    pub fn list_routing_rules(&self) -> Result<Vec<RoutingRule>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_instance, to_instance, type_pattern, max_retries, ttl_secs, auto_start, created_at
+             FROM routing_rules ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RoutingRule {
+                id: row.get(0)?,
+                from_instance: row.get(1)?,
+                to_instance: row.get(2)?,
+                type_pattern: row.get(3)?,
+                max_retries: row.get(4)?,
+                ttl_secs: row.get(5)?,
+                auto_start: row.get::<_, i64>(6)? != 0,
+                created_at: row.get(7)?,
+            })
+        })?;
+        let mut rules = Vec::new();
+        for row in rows {
+            rules.push(row?);
+        }
+        Ok(rules)
+    }
+
+    /// Delete a routing rule by ID. Returns true if a row was deleted.
+    pub fn delete_routing_rule(&self, id: &str) -> Result<bool> {
+        let rows = self
+            .conn
+            .execute("DELETE FROM routing_rules WHERE id = ?1", params![id])
+            .context("Failed to delete routing rule")?;
+        Ok(rows > 0)
+    }
+
+    /// Check if a route is allowed. Matches exact from/to and prefix match on type.
+    /// Returns the matching rule if found.
+    pub fn check_route_allowed(
+        &self,
+        from: &str,
+        to: &str,
+        message_type: &str,
+    ) -> Result<Option<RoutingRule>> {
+        // Fetch all rules matching from/to, then check type_pattern in Rust
+        // (prefix match: "task.*" matches "task.handoff", "*" matches everything)
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_instance, to_instance, type_pattern, max_retries, ttl_secs, auto_start, created_at
+             FROM routing_rules WHERE from_instance = ?1 AND to_instance = ?2",
+        )?;
+        let rows = stmt.query_map(params![from, to], |row| {
+            Ok(RoutingRule {
+                id: row.get(0)?,
+                from_instance: row.get(1)?,
+                to_instance: row.get(2)?,
+                type_pattern: row.get(3)?,
+                max_retries: row.get(4)?,
+                ttl_secs: row.get(5)?,
+                auto_start: row.get::<_, i64>(6)? != 0,
+                created_at: row.get(7)?,
+            })
+        })?;
+
+        for row in rows {
+            let rule = row?;
+            if type_pattern_matches(&rule.type_pattern, message_type) {
+                return Ok(Some(rule));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Check if an idempotency key already exists. Returns the existing message ID if so.
+    pub fn check_idempotency_key(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM messages WHERE idempotency_key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to check idempotency key")
+    }
+
+    /// Enqueue a new message. Returns the created Message.
+    pub fn enqueue_message(&self, msg: &NewMessage) -> Result<Message> {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(msg.ttl_secs))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        self.conn.execute(
+            "INSERT INTO messages (id, from_instance, to_instance, message_type, payload, correlation_id, idempotency_key, hop_count, status, retry_count, max_retries, expires_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 0, ?9, ?10, ?11, ?12)",
+            params![
+                msg.id,
+                msg.from_instance,
+                msg.to_instance,
+                msg.message_type,
+                msg.payload,
+                msg.correlation_id,
+                msg.idempotency_key,
+                msg.hop_count,
+                msg.max_retries,
+                expires_at,
+                now,
+                now,
+            ],
+        ).context("Failed to enqueue message")?;
+
+        // Fetch back the full row
+        self.get_message(&msg.id)?
+            .ok_or_else(|| anyhow::anyhow!("Message {} not found after insert", msg.id))
+    }
+
+    /// Get a message by ID.
+    pub fn get_message(&self, id: &str) -> Result<Option<Message>> {
+        self.conn
+            .query_row(
+                "SELECT id, from_instance, to_instance, message_type, payload, correlation_id, idempotency_key, hop_count, status, retry_count, max_retries, next_attempt_at, lease_expires_at, expires_at, created_at, updated_at
+                 FROM messages WHERE id = ?1",
+                params![id],
+                Self::row_to_message,
+            )
+            .optional()
+            .context("Failed to query message")
+    }
+
+    /// Atomically lease the oldest queued message for an instance.
+    /// Sets status to 'leased' and lease_expires_at to now + 90s.
+    pub fn lease_pending_message(&self, to_instance: &str) -> Result<Option<Message>> {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let lease_expires = (chrono::Utc::now() + chrono::Duration::seconds(90))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        // Find oldest queued message where next_attempt_at has passed (or is null)
+        let msg_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM messages
+                 WHERE to_instance = ?1 AND status = 'queued'
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
+                 ORDER BY created_at ASC LIMIT 1",
+                params![to_instance, now],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to query pending message")?;
+
+        let msg_id = match msg_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        // Transition to leased
+        self.conn.execute(
+            "UPDATE messages SET status = 'leased', lease_expires_at = ?1, updated_at = ?2 WHERE id = ?3",
+            params![lease_expires, now, msg_id],
+        )?;
+
+        self.get_message(&msg_id)
+    }
+
+    /// Acknowledge a message (mark as acknowledged).
+    pub fn acknowledge_message(&self, id: &str) -> Result<bool> {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let rows = self.conn.execute(
+            "UPDATE messages SET status = 'acknowledged', updated_at = ?1 WHERE id = ?2 AND status = 'leased'",
+            params![now, id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Get messages with expired leases (leased + lease_expires_at < now).
+    pub fn get_expired_leases(&self) -> Result<Vec<Message>> {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_instance, to_instance, message_type, payload, correlation_id, idempotency_key, hop_count, status, retry_count, max_retries, next_attempt_at, lease_expires_at, expires_at, created_at, updated_at
+             FROM messages WHERE status = 'leased' AND lease_expires_at < ?1",
+        )?;
+        let rows = stmt.query_map(params![now], Self::row_to_message)?;
+        let mut msgs = Vec::new();
+        for row in rows {
+            msgs.push(row?);
+        }
+        Ok(msgs)
+    }
+
+    /// Get messages with expired TTL (queued/leased + expires_at < now).
+    pub fn get_ttl_expired_messages(&self) -> Result<Vec<Message>> {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_instance, to_instance, message_type, payload, correlation_id, idempotency_key, hop_count, status, retry_count, max_retries, next_attempt_at, lease_expires_at, expires_at, created_at, updated_at
+             FROM messages WHERE status IN ('queued', 'leased') AND expires_at < ?1",
+        )?;
+        let rows = stmt.query_map(params![now], Self::row_to_message)?;
+        let mut msgs = Vec::new();
+        for row in rows {
+            msgs.push(row?);
+        }
+        Ok(msgs)
+    }
+
+    /// Retry a message: increment retry_count, set backoff, return to queued.
+    pub fn retry_message(&self, id: &str) -> Result<()> {
+        let now = chrono::Utc::now();
+        let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+
+        // Get current retry_count
+        let retry_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT retry_count FROM messages WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .context("Failed to get retry count")?;
+
+        let new_retry = retry_count + 1;
+        // Backoff: min(1s * 2^retry_count, 60s) + jitter(0..500ms)
+        let base_secs = (1i64 << retry_count.min(6)).min(60);
+        let jitter_ms = (uuid::Uuid::new_v4().as_bytes()[0] as i64 % 500).abs();
+        let delay = chrono::Duration::milliseconds(base_secs * 1000 + jitter_ms);
+        let next_attempt = (now + delay).format("%Y-%m-%d %H:%M:%S").to_string();
+
+        self.conn.execute(
+            "UPDATE messages SET status = 'queued', retry_count = ?1, next_attempt_at = ?2, lease_expires_at = NULL, updated_at = ?3 WHERE id = ?4",
+            params![new_retry, next_attempt, now_str, id],
+        )?;
+        Ok(())
+    }
+
+    /// Move a message to dead_letter status.
+    pub fn dead_letter_message(&self, id: &str, reason: &str) -> Result<()> {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        self.conn.execute(
+            "UPDATE messages SET status = 'dead_letter', updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        self.append_message_event(id, "dead_lettered", Some(reason))?;
+        Ok(())
+    }
+
+    /// Append an audit event for a message.
+    pub fn append_message_event(
+        &self,
+        message_id: &str,
+        event_type: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO message_events (message_id, event_type, detail) VALUES (?1, ?2, ?3)",
+                params![message_id, event_type, detail],
+            )
+            .context("Failed to insert message event")?;
+        Ok(())
+    }
+
+    /// Get queued messages where recipient is stopped and routing rule has auto_start.
+    pub fn get_instances_needing_autostart(&self) -> Result<Vec<(Message, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.from_instance, m.to_instance, m.message_type, m.payload, m.correlation_id, m.idempotency_key, m.hop_count, m.status, m.retry_count, m.max_retries, m.next_attempt_at, m.lease_expires_at, m.expires_at, m.created_at, m.updated_at, r.to_instance
+             FROM messages m
+             JOIN routing_rules r ON m.from_instance = r.from_instance AND m.to_instance = r.to_instance AND r.auto_start = 1
+             JOIN instances i ON i.name = m.to_instance AND i.archived_at IS NULL AND i.status = 'stopped'
+             WHERE m.status = 'queued'
+             GROUP BY m.to_instance",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let msg = Message {
+                id: row.get(0)?,
+                from_instance: row.get(1)?,
+                to_instance: row.get(2)?,
+                message_type: row.get(3)?,
+                payload: row.get(4)?,
+                correlation_id: row.get(5)?,
+                idempotency_key: row.get(6)?,
+                hop_count: row.get(7)?,
+                status: row.get(8)?,
+                retry_count: row.get(9)?,
+                max_retries: row.get(10)?,
+                next_attempt_at: row.get(11)?,
+                lease_expires_at: row.get(12)?,
+                expires_at: row.get(13)?,
+                created_at: row.get(14)?,
+                updated_at: row.get(15)?,
+            };
+            let instance_name: String = row.get(16)?;
+            Ok((msg, instance_name))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+        Ok(Message {
+            id: row.get(0)?,
+            from_instance: row.get(1)?,
+            to_instance: row.get(2)?,
+            message_type: row.get(3)?,
+            payload: row.get(4)?,
+            correlation_id: row.get(5)?,
+            idempotency_key: row.get(6)?,
+            hop_count: row.get(7)?,
+            status: row.get(8)?,
+            retry_count: row.get(9)?,
+            max_retries: row.get(10)?,
+            next_attempt_at: row.get(11)?,
+            lease_expires_at: row.get(12)?,
+            expires_at: row.get(13)?,
+            created_at: row.get(14)?,
+            updated_at: row.get(15)?,
+        })
+    }
+
     /// List all non-archived instances.
     pub fn list_instances(&self) -> Result<Vec<Instance>> {
         let mut stmt = self.conn.prepare(
@@ -555,9 +1013,40 @@ impl Registry {
     }
 }
 
+/// Check if a type pattern matches a message type.
+/// "*" matches everything. "task.*" matches "task.handoff". Exact match otherwise.
+fn type_pattern_matches(pattern: &str, message_type: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix(".*") {
+        return message_type == prefix || message_type.starts_with(&format!("{prefix}."));
+    }
+    pattern == message_type
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type_pattern_wildcard() {
+        assert!(type_pattern_matches("*", "anything"));
+        assert!(type_pattern_matches("*", ""));
+    }
+
+    #[test]
+    fn type_pattern_prefix() {
+        assert!(type_pattern_matches("task.*", "task.handoff"));
+        assert!(type_pattern_matches("task.*", "task"));
+        assert!(!type_pattern_matches("task.*", "other.thing"));
+    }
+
+    #[test]
+    fn type_pattern_exact() {
+        assert!(type_pattern_matches("task.handoff", "task.handoff"));
+        assert!(!type_pattern_matches("task.handoff", "task.other"));
+    }
 
     #[test]
     fn create_and_get_instance() {
