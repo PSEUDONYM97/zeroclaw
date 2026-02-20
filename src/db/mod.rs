@@ -1071,10 +1071,19 @@ impl Registry {
 
     /// List all non-archived instances.
     pub fn list_instances(&self) -> Result<Vec<Instance>> {
-        let mut stmt = self.conn.prepare(
+        self.list_instances_filtered(false)
+    }
+
+    /// List instances, optionally including archived ones.
+    pub fn list_instances_filtered(&self, include_archived: bool) -> Result<Vec<Instance>> {
+        let sql = if include_archived {
             "SELECT id, name, status, port, config_path, workspace_dir, archived_at, migration_run_id, pid
-             FROM instances WHERE archived_at IS NULL ORDER BY name",
-        )?;
+             FROM instances ORDER BY archived_at IS NOT NULL, name"
+        } else {
+            "SELECT id, name, status, port, config_path, workspace_dir, archived_at, migration_run_id, pid
+             FROM instances WHERE archived_at IS NULL ORDER BY name"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([], |row| {
             Ok(Instance {
                 id: row.get(0)?,

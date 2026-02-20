@@ -274,6 +274,62 @@ a:hover { text-decoration: underline; }
   display: flex; align-items: center; gap: 12px;
   margin-top: 12px; font-size: 13px; color: var(--text-dim);
 }
+
+/* Modal overlay */
+.modal-overlay {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.6); z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+}
+.modal {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 24px;
+  min-width: 400px; max-width: 500px; width: 90%;
+}
+.modal h3 { font-size: 16px; margin-bottom: 16px; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+
+/* Form inputs */
+.form-group { margin-bottom: 14px; }
+.form-label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 4px; }
+.form-input {
+  width: 100%; padding: 8px 12px;
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text);
+  font-family: var(--mono); font-size: 13px;
+}
+.form-input:focus { outline: none; border-color: var(--blue); }
+.form-hint { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+/* Danger button */
+.btn-danger { border-color: var(--red); color: var(--red); }
+.btn-danger:hover { background: rgba(245,85,93,0.1); }
+.btn-archive { border-color: var(--orange); color: var(--orange); }
+.btn-archive:hover { background: rgba(209,154,102,0.1); }
+.btn-clone { border-color: var(--purple); color: var(--purple); }
+.btn-clone:hover { background: rgba(198,120,221,0.1); }
+
+/* Archived badge */
+.status-archived { color: var(--text-dim); }
+.status-archived::before { background: var(--text-dim); }
+
+/* Archived card */
+.card-archived { opacity: 0.6; border-style: dashed; }
+.card-archived:hover { opacity: 0.85; }
+
+/* Dashboard toolbar */
+.dashboard-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 16px; gap: 12px; flex-wrap: wrap;
+}
+.toolbar-right { display: flex; align-items: center; gap: 12px; }
+
+/* Checkbox toggle */
+.toggle-label {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--text-dim); cursor: pointer;
+}
+.toggle-label input { cursor: pointer; }
 </style>
 </head>
 <body>
@@ -291,12 +347,14 @@ a:hover { text-decoration: underline; }
 const state = {
   view: 'dashboard',
   instance: null,
+  instanceArchived: false,
   tab: 'overview',
   instances: [],
   refreshTimer: null,
   abortController: null,
   configEtag: null,
   routeGeneration: 0,
+  showArchived: false,
 };
 
 // ── DOM helpers (XSS-safe) ───────────────────────────────────────
@@ -326,6 +384,7 @@ function statusClass(s) {
   if (s === 'stopped') return 'status-stopped';
   if (s === 'stale-pid') return 'status-stale-pid';
   if (s === 'dead') return 'status-dead';
+  if (s === 'archived') return 'status-archived';
   return 'status-unknown';
 }
 
@@ -360,6 +419,42 @@ function showNotify(container, type, msg) {
   }
 }
 
+// ── Modal helpers ────────────────────────────────────────────────
+function showModal(contentEl) {
+  closeModal();
+  var overlay = h('div', { className: 'modal-overlay', id: 'modal-overlay' });
+  overlay.addEventListener('click', function(e) {
+    if (e.target === overlay) closeModal();
+  });
+  overlay.appendChild(contentEl);
+  document.body.appendChild(overlay);
+}
+
+function closeModal() {
+  var existing = document.getElementById('modal-overlay');
+  if (existing) existing.remove();
+}
+
+function confirmDialog(title, message, confirmLabel, confirmClass, onConfirm) {
+  var modal = h('div', { className: 'modal' },
+    h('h3', { textContent: title }),
+    h('p', { textContent: message, style: 'font-size:13px;color:var(--text-dim);margin-bottom:8px' }),
+    h('div', { className: 'modal-actions' },
+      h('button', { className: 'btn', textContent: 'Cancel', onClick: closeModal }),
+      h('button', { className: 'btn ' + (confirmClass || 'btn-primary'), textContent: confirmLabel, onClick: function() {
+        closeModal();
+        onConfirm();
+      }})
+    )
+  );
+  showModal(modal);
+}
+
+function apiErrorMsg(res) {
+  if (res.data && res.data.error) return res.data.error;
+  return 'Request failed (HTTP ' + res.status + ')';
+}
+
 // ── API wrapper ──────────────────────────────────────────────────
 async function api(path, opts) {
   opts = opts || {};
@@ -387,16 +482,22 @@ function route() {
   const gen = state.routeGeneration;
 
   const hash = location.hash || '#/';
-  const parts = hash.replace('#/', '').split('/');
+  // Split hash from query: #/instance/name?archived=1 -> parts + query
+  var hashAndQuery = hash.replace('#/', '').split('?');
+  const parts = hashAndQuery[0].split('/');
+  var queryStr = hashAndQuery[1] || '';
+  var queryArchived = queryStr.indexOf('archived=1') !== -1;
 
   if (parts[0] === 'instance' && parts[1]) {
     state.view = 'instance';
     state.instance = decodeURIComponent(parts[1]);
+    state.instanceArchived = queryArchived;
     state.tab = parts[2] || 'overview';
     renderInstance(gen);
   } else {
     state.view = 'dashboard';
     state.instance = null;
+    state.instanceArchived = false;
     state.tab = 'overview';
     renderDashboard(gen);
   }
@@ -405,13 +506,17 @@ function route() {
 window.addEventListener('hashchange', route);
 
 // ── Dashboard ────────────────────────────────────────────────────
+function instancesApiPath() {
+  return '/instances' + (state.showArchived ? '?include_archived=true' : '');
+}
+
 async function renderDashboard(gen) {
   const app = document.getElementById('app');
   clear(app);
   app.appendChild(h('div', { className: 'loading', textContent: 'Loading instances...' }));
 
   try {
-    const res = await api('/instances');
+    const res = await api(instancesApiPath());
     if (gen !== state.routeGeneration) return;
     if (res.status === 200 && Array.isArray(res.data)) {
       state.instances = res.data;
@@ -429,13 +534,12 @@ async function renderDashboard(gen) {
 
   state.refreshTimer = setInterval(async function() {
     try {
-      const res = await api('/instances');
+      const res = await api(instancesApiPath());
       if (gen !== state.routeGeneration) return;
       if (res.status === 200 && Array.isArray(res.data)) {
         state.instances = res.data;
         paintDashboard();
       }
-      // On refresh errors, retain the last good state rather than clobbering the UI
     } catch (e) {
       if (e.name === 'AbortError') return;
     }
@@ -446,26 +550,276 @@ function paintDashboard() {
   const app = document.getElementById('app');
   clear(app);
 
-  if (state.instances.length === 0) {
-    app.appendChild(h('div', { className: 'empty-state', textContent: 'No instances registered. Use the CLI to create one.' }));
+  // Notification area
+  app.appendChild(h('div', { id: 'dashboard-notify' }));
+
+  // Toolbar
+  var archiveCheckbox = h('input', { type: 'checkbox', id: 'show-archived-cb' });
+  archiveCheckbox.checked = state.showArchived;
+  archiveCheckbox.addEventListener('change', function() {
+    state.showArchived = this.checked;
+    route();
+  });
+
+  var toolbar = h('div', { className: 'dashboard-toolbar' },
+    h('button', { className: 'btn btn-primary', textContent: '+ New Instance', onClick: showCreateDialog }),
+    h('div', { className: 'toolbar-right' },
+      h('label', { className: 'toggle-label' },
+        archiveCheckbox,
+        'Show archived'
+      )
+    )
+  );
+  app.appendChild(toolbar);
+
+  var active = state.instances.filter(function(i) { return !i.archived_at; });
+  var archived = state.instances.filter(function(i) { return !!i.archived_at; });
+
+  if (active.length === 0 && archived.length === 0) {
+    app.appendChild(h('div', { className: 'empty-state', textContent: 'No instances yet. Click "New Instance" to create one.' }));
     return;
   }
 
-  const grid = h('div', { className: 'cards' });
-  for (const inst of state.instances) {
-    const card = h('div', { className: 'card', onClick: function() { location.hash = '#/instance/' + encodeURIComponent(inst.name); } },
-      h('div', { className: 'card-header' },
-        h('span', { className: 'card-name', textContent: inst.name }),
-        h('span', { className: 'status ' + statusClass(inst.status), textContent: inst.status })
-      ),
-      h('div', { className: 'card-meta' },
-        h('span', { textContent: 'Port: ' + (inst.port || '-') }),
-        inst.pid ? h('span', { textContent: 'PID: ' + inst.pid }) : null
-      )
-    );
-    grid.appendChild(card);
+  // Active instances grid
+  if (active.length > 0) {
+    var grid = h('div', { className: 'cards' });
+    for (var inst of active) {
+      grid.appendChild(makeInstanceCard(inst, false));
+    }
+    app.appendChild(grid);
   }
-  app.appendChild(grid);
+
+  // Archived instances (only if toggle is on)
+  if (archived.length > 0 && state.showArchived) {
+    app.appendChild(h('h3', { textContent: 'Archived', style: 'margin-top:24px;margin-bottom:12px;font-size:14px;color:var(--text-dim)' }));
+    var archiveGrid = h('div', { className: 'cards' });
+    for (var aInst of archived) {
+      archiveGrid.appendChild(makeInstanceCard(aInst, true));
+    }
+    app.appendChild(archiveGrid);
+  }
+}
+
+function makeInstanceCard(inst, isArchived) {
+  var card = h('div', { className: 'card' + (isArchived ? ' card-archived' : ''), onClick: function() {
+    location.hash = '#/instance/' + encodeURIComponent(inst.name) + (isArchived ? '?archived=1' : '');
+  }},
+    h('div', { className: 'card-header' },
+      h('span', { className: 'card-name', textContent: inst.name }),
+      h('span', { className: 'status ' + statusClass(inst.status), textContent: inst.status })
+    ),
+    h('div', { className: 'card-meta' },
+      h('span', { textContent: 'Port: ' + (inst.port || '-') }),
+      inst.pid ? h('span', { textContent: 'PID: ' + inst.pid }) : null,
+      isArchived ? h('span', { textContent: 'Archived: ' + inst.archived_at, style: 'color:var(--text-dim)' }) : null
+    )
+  );
+  return card;
+}
+
+// ── Create instance dialog ──────────────────────────────────────
+function showCreateDialog() {
+  var nameInput = h('input', { className: 'form-input', type: 'text', id: 'create-name', placeholder: 'my-agent' });
+  var portInput = h('input', { className: 'form-input', type: 'number', id: 'create-port', placeholder: 'Auto-assign' });
+  var providerInput = h('input', { className: 'form-input', type: 'text', id: 'create-provider', placeholder: 'openrouter' });
+  var modelInput = h('input', { className: 'form-input', type: 'text', id: 'create-model', placeholder: 'anthropic/claude-sonnet-4-20250514' });
+  var errorDiv = h('div', { id: 'create-error' });
+
+  var modal = h('div', { className: 'modal' },
+    h('h3', { textContent: 'Create Instance' }),
+    errorDiv,
+    h('div', { className: 'form-group' },
+      h('label', { className: 'form-label', textContent: 'Name *' }),
+      nameInput,
+      h('div', { className: 'form-hint', textContent: 'Letters, digits, hyphens. 1-64 chars.' })
+    ),
+    h('div', { className: 'form-group' },
+      h('label', { className: 'form-label', textContent: 'Port' }),
+      portInput,
+      h('div', { className: 'form-hint', textContent: 'Leave empty for auto-assignment (18801-18999).' })
+    ),
+    h('div', { className: 'form-group' },
+      h('label', { className: 'form-label', textContent: 'Model Provider' }),
+      providerInput
+    ),
+    h('div', { className: 'form-group' },
+      h('label', { className: 'form-label', textContent: 'Model Name' }),
+      modelInput
+    ),
+    h('div', { className: 'modal-actions' },
+      h('button', { className: 'btn', textContent: 'Cancel', onClick: closeModal }),
+      h('button', { className: 'btn btn-primary', id: 'create-submit', textContent: 'Create', onClick: doCreateInstance })
+    )
+  );
+  showModal(modal);
+  nameInput.focus();
+}
+
+async function doCreateInstance() {
+  var name = (document.getElementById('create-name') || {}).value || '';
+  var portStr = (document.getElementById('create-port') || {}).value || '';
+  var provider = (document.getElementById('create-provider') || {}).value || '';
+  var model = (document.getElementById('create-model') || {}).value || '';
+  var errorDiv = document.getElementById('create-error');
+  var submitBtn = document.getElementById('create-submit');
+
+  if (!name.trim()) {
+    if (errorDiv) { clear(errorDiv); errorDiv.appendChild(h('div', { className: 'notify notify-error', textContent: 'Name is required' })); }
+    return;
+  }
+
+  var body = { name: name.trim() };
+  if (portStr) body.port = parseInt(portStr, 10);
+  if (provider) body.model_provider = provider;
+  if (model) body.model_name = model;
+
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Creating...'; }
+
+  try {
+    var res = await api('/instances', { method: 'POST', body: body });
+    if (res.status === 201) {
+      closeModal();
+      route(); // refresh dashboard
+      setTimeout(function() {
+        var notify = document.getElementById('dashboard-notify');
+        if (notify) showNotify(notify, 'success', 'Instance "' + name + '" created on port ' + (res.data && res.data.port));
+      }, 100);
+    } else {
+      if (errorDiv) { clear(errorDiv); errorDiv.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) })); }
+      if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Create'; }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    if (errorDiv) { clear(errorDiv); errorDiv.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message })); }
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Create'; }
+  }
+}
+
+// ── Clone instance dialog ───────────────────────────────────────
+function showCloneDialog(sourceName) {
+  var nameInput = h('input', { className: 'form-input', type: 'text', id: 'clone-name', placeholder: sourceName + '-clone' });
+  var portInput = h('input', { className: 'form-input', type: 'number', id: 'clone-port', placeholder: 'Auto-assign' });
+  var errorDiv = h('div', { id: 'clone-error' });
+
+  var modal = h('div', { className: 'modal' },
+    h('h3', { textContent: 'Clone "' + sourceName + '"' }),
+    h('p', { textContent: 'Creates an independent copy with a new UUID, port, and cleared auth state.', style: 'font-size:13px;color:var(--text-dim);margin-bottom:12px' }),
+    errorDiv,
+    h('div', { className: 'form-group' },
+      h('label', { className: 'form-label', textContent: 'New Name *' }),
+      nameInput
+    ),
+    h('div', { className: 'form-group' },
+      h('label', { className: 'form-label', textContent: 'Port' }),
+      portInput,
+      h('div', { className: 'form-hint', textContent: 'Leave empty for auto-assignment.' })
+    ),
+    h('div', { className: 'modal-actions' },
+      h('button', { className: 'btn', textContent: 'Cancel', onClick: closeModal }),
+      h('button', { className: 'btn btn-clone', id: 'clone-submit', textContent: 'Clone', onClick: function() { doCloneInstance(sourceName); } })
+    )
+  );
+  showModal(modal);
+  nameInput.focus();
+}
+
+async function doCloneInstance(sourceName) {
+  var newName = (document.getElementById('clone-name') || {}).value || '';
+  var portStr = (document.getElementById('clone-port') || {}).value || '';
+  var errorDiv = document.getElementById('clone-error');
+  var submitBtn = document.getElementById('clone-submit');
+
+  if (!newName.trim()) {
+    if (errorDiv) { clear(errorDiv); errorDiv.appendChild(h('div', { className: 'notify notify-error', textContent: 'Name is required' })); }
+    return;
+  }
+
+  var body = { new_name: newName.trim() };
+  if (portStr) body.port = parseInt(portStr, 10);
+
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Cloning...'; }
+
+  try {
+    var res = await api('/instances/' + encodeURIComponent(sourceName) + '/clone', { method: 'POST', body: body });
+    if (res.status === 201) {
+      closeModal();
+      location.hash = '#/instance/' + encodeURIComponent(newName.trim());
+    } else {
+      if (errorDiv) { clear(errorDiv); errorDiv.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) })); }
+      if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Clone'; }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    if (errorDiv) { clear(errorDiv); errorDiv.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message })); }
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Clone'; }
+  }
+}
+
+// ── Archive / Unarchive / Delete actions ────────────────────────
+async function doArchiveInstance(name) {
+  confirmDialog(
+    'Archive "' + name + '"?',
+    'This will stop the instance if running and remove it from the active list. You can unarchive it later.',
+    'Archive',
+    'btn-archive',
+    async function() {
+      try {
+        var res = await api('/instances/' + encodeURIComponent(name) + '/archive', { method: 'POST' });
+        if (res.status === 200) {
+          location.hash = '#/';
+          setTimeout(function() {
+            var notify = document.getElementById('dashboard-notify');
+            if (notify) showNotify(notify, 'success', '"' + name + '" archived');
+          }, 100);
+        } else {
+          var content = document.getElementById('tab-content');
+          if (content) showNotify(content, 'error', apiErrorMsg(res));
+        }
+      } catch (e) {
+        if (e.name === 'AbortError') return;
+      }
+    }
+  );
+}
+
+async function doUnarchiveInstance(name) {
+  try {
+    var res = await api('/instances/' + encodeURIComponent(name) + '/unarchive', { method: 'POST' });
+    if (res.status === 200) {
+      location.hash = '#/instance/' + encodeURIComponent(name);
+    } else {
+      var content = document.getElementById('tab-content');
+      if (content) showNotify(content, 'error', apiErrorMsg(res));
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+  }
+}
+
+async function doDeleteInstance(name) {
+  confirmDialog(
+    'Permanently delete "' + name + '"?',
+    'This will remove all config, workspace, and event data. Messages are preserved. This cannot be undone.',
+    'Delete permanently',
+    'btn-danger',
+    async function() {
+      try {
+        var res = await api('/instances/' + encodeURIComponent(name), { method: 'DELETE' });
+        if (res.status === 200) {
+          location.hash = '#/';
+          setTimeout(function() {
+            var notify = document.getElementById('dashboard-notify');
+            if (notify) showNotify(notify, 'success', '"' + name + '" deleted');
+          }, 100);
+        } else {
+          var content = document.getElementById('tab-content');
+          if (content) showNotify(content, 'error', apiErrorMsg(res));
+        }
+      } catch (e) {
+        if (e.name === 'AbortError') return;
+      }
+    }
+  );
 }
 
 // ── Instance detail ──────────────────────────────────────────────
@@ -541,31 +895,52 @@ function paintOverview(data) {
 
   // Action buttons
   var btns = document.getElementById('action-btns');
+  var isArchived = inst.status === 'archived' || state.instanceArchived;
   if (btns) {
     clear(btns);
-    btns.appendChild(makeActionBtn('Start', 'btn-start', '/instances/' + encodeURIComponent(inst.name) + '/start', 'POST'));
-    btns.appendChild(makeActionBtn('Stop', 'btn-stop', '/instances/' + encodeURIComponent(inst.name) + '/stop', 'POST'));
-    btns.appendChild(makeActionBtn('Restart', 'btn-restart', '/instances/' + encodeURIComponent(inst.name) + '/restart', 'POST'));
+    if (isArchived) {
+      // Archived instance: unarchive + delete
+      btns.appendChild(h('button', { className: 'btn btn-primary', textContent: 'Unarchive', onClick: function() { doUnarchiveInstance(inst.name); } }));
+      btns.appendChild(h('button', { className: 'btn btn-danger', textContent: 'Delete', onClick: function() { doDeleteInstance(inst.name); } }));
+    } else {
+      // Active instance: lifecycle + archive/clone
+      btns.appendChild(makeActionBtn('Start', 'btn-start', '/instances/' + encodeURIComponent(inst.name) + '/start', 'POST'));
+      btns.appendChild(makeActionBtn('Stop', 'btn-stop', '/instances/' + encodeURIComponent(inst.name) + '/stop', 'POST'));
+      btns.appendChild(makeActionBtn('Restart', 'btn-restart', '/instances/' + encodeURIComponent(inst.name) + '/restart', 'POST'));
+      btns.appendChild(h('button', { className: 'btn btn-clone', textContent: 'Clone', onClick: function() { showCloneDialog(inst.name); } }));
+      btns.appendChild(h('button', { className: 'btn btn-archive', textContent: 'Archive', onClick: function() { doArchiveInstance(inst.name); } }));
+    }
+  }
+
+  // Archived banner
+  if (isArchived) {
+    content.appendChild(h('div', { className: 'notify notify-warn', style: 'margin-bottom:16px',
+      textContent: 'This instance is archived. Unarchive it to start or modify it.' }));
   }
 
   // Instance info panel
+  var detailGrid = h('div', { className: 'detail-grid' },
+    h('span', { className: 'detail-label', textContent: 'Name' }),
+    h('span', { className: 'detail-value', textContent: inst.name || '-' }),
+    h('span', { className: 'detail-label', textContent: 'ID' }),
+    h('span', { className: 'detail-value', textContent: inst.id || '-' }),
+    h('span', { className: 'detail-label', textContent: 'Port' }),
+    h('span', { className: 'detail-value', textContent: String(inst.port || '-') }),
+    h('span', { className: 'detail-label', textContent: 'PID' }),
+    h('span', { className: 'detail-value', textContent: inst.pid ? String(inst.pid) : 'None' }),
+    h('span', { className: 'detail-label', textContent: 'Status' }),
+    h('span', { className: 'detail-value', textContent: inst.status || 'unknown' })
+  );
+  if (inst.archived_at) {
+    detailGrid.appendChild(h('span', { className: 'detail-label', textContent: 'Archived' }));
+    detailGrid.appendChild(h('span', { className: 'detail-value', textContent: inst.archived_at }));
+  }
   var panel = h('div', { className: 'panel' },
     h('div', { className: 'panel-header' },
       h('span', { className: 'panel-title', textContent: 'Instance Details' }),
       h('span', { className: 'status ' + statusClass(inst.status), textContent: inst.status || 'unknown' })
     ),
-    h('div', { className: 'detail-grid' },
-      h('span', { className: 'detail-label', textContent: 'Name' }),
-      h('span', { className: 'detail-value', textContent: inst.name || '-' }),
-      h('span', { className: 'detail-label', textContent: 'ID' }),
-      h('span', { className: 'detail-value', textContent: inst.id || '-' }),
-      h('span', { className: 'detail-label', textContent: 'Port' }),
-      h('span', { className: 'detail-value', textContent: String(inst.port || '-') }),
-      h('span', { className: 'detail-label', textContent: 'PID' }),
-      h('span', { className: 'detail-value', textContent: inst.pid ? String(inst.pid) : 'None' }),
-      h('span', { className: 'detail-label', textContent: 'Status' }),
-      h('span', { className: 'detail-value', textContent: inst.status || 'unknown' })
-    )
+    detailGrid
   );
   content.appendChild(panel);
 

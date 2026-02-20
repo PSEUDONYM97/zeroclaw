@@ -706,3 +706,256 @@ async fn two_step_delete_flow() -> Result<()> {
 
     Ok(())
 }
+
+// ══════════════════════════════════════════════════════════════════
+// Phase 13.5: UI-flow gate tests
+// ══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn include_archived_query_param() -> Result<()> {
+    let (_tmp, db_path) = setup_with_instance("alpha", 18810);
+    let (base_url, _shutdown) = start_test_server(db_path).await;
+    let client = reqwest::Client::new();
+
+    // Archive the instance
+    let resp = client
+        .post(format!("{base_url}/api/instances/alpha/archive"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+
+    // Default list (no archived) should be empty
+    let resp = client
+        .get(format!("{base_url}/api/instances"))
+        .send()
+        .await?;
+    let list: Vec<serde_json::Value> = resp.json().await?;
+    assert!(list.is_empty(), "Archived instances should not appear in default list");
+
+    // With include_archived=true should return the archived instance
+    let resp = client
+        .get(format!("{base_url}/api/instances?include_archived=true"))
+        .send()
+        .await?;
+    let list: Vec<serde_json::Value> = resp.json().await?;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["name"], "alpha");
+    assert_eq!(list[0]["status"], "archived");
+    assert!(list[0]["archived_at"].is_string(), "archived_at should be set");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_instance_returns_archived() -> Result<()> {
+    let (_tmp, db_path) = setup_with_instance("beta", 18811);
+    let (base_url, _shutdown) = start_test_server(db_path).await;
+    let client = reqwest::Client::new();
+
+    // Archive
+    client
+        .post(format!("{base_url}/api/instances/beta/archive"))
+        .send()
+        .await?;
+
+    // GET /instances/:name should still find archived instance
+    let resp = client
+        .get(format!("{base_url}/api/instances/beta"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["name"], "beta");
+    assert_eq!(body["status"], "archived");
+    assert!(body["archived_at"].is_string());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn details_endpoint_returns_archived() -> Result<()> {
+    let (_tmp, db_path) = setup_with_instance("gamma", 18812);
+    let (base_url, _shutdown) = start_test_server(db_path).await;
+    let client = reqwest::Client::new();
+
+    // Archive
+    client
+        .post(format!("{base_url}/api/instances/gamma/archive"))
+        .send()
+        .await?;
+
+    // GET /instances/:name/details should work for archived instances
+    let resp = client
+        .get(format!("{base_url}/api/instances/gamma/details"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["instance"]["name"], "gamma");
+    assert_eq!(body["instance"]["status"], "archived");
+    assert!(body["instance"]["archived_at"].is_string());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_crud_lifecycle_flow() -> Result<()> {
+    let (_tmp, db_path) = setup_cp();
+    let (base_url, _shutdown) = start_test_server(db_path).await;
+    let client = reqwest::Client::new();
+
+    // 1. Create
+    let resp = client
+        .post(format!("{base_url}/api/instances"))
+        .json(&serde_json::json!({ "name": "lifecycle-test" }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 201);
+    let created: serde_json::Value = resp.json().await?;
+    let port = created["port"].as_u64().unwrap();
+    assert!(port >= 18801 && port <= 18999);
+
+    // 2. Visible in list
+    let resp = client
+        .get(format!("{base_url}/api/instances"))
+        .send()
+        .await?;
+    let list: Vec<serde_json::Value> = resp.json().await?;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["name"], "lifecycle-test");
+
+    // 3. Clone
+    let resp = client
+        .post(format!("{base_url}/api/instances/lifecycle-test/clone"))
+        .json(&serde_json::json!({ "new_name": "lifecycle-clone" }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 201);
+    let cloned: serde_json::Value = resp.json().await?;
+    assert_eq!(cloned["name"], "lifecycle-clone");
+    assert_ne!(cloned["port"].as_u64(), Some(port), "Clone should get different port");
+
+    // 4. List now has 2
+    let resp = client
+        .get(format!("{base_url}/api/instances"))
+        .send()
+        .await?;
+    let list: Vec<serde_json::Value> = resp.json().await?;
+    assert_eq!(list.len(), 2);
+
+    // 5. Archive clone
+    let resp = client
+        .post(format!("{base_url}/api/instances/lifecycle-clone/archive"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+
+    // 6. Default list has 1
+    let resp = client
+        .get(format!("{base_url}/api/instances"))
+        .send()
+        .await?;
+    let list: Vec<serde_json::Value> = resp.json().await?;
+    assert_eq!(list.len(), 1);
+
+    // 7. Include archived shows 2
+    let resp = client
+        .get(format!("{base_url}/api/instances?include_archived=true"))
+        .send()
+        .await?;
+    let list: Vec<serde_json::Value> = resp.json().await?;
+    assert_eq!(list.len(), 2);
+
+    // 8. Archived detail view works
+    let resp = client
+        .get(format!("{base_url}/api/instances/lifecycle-clone/details"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let det: serde_json::Value = resp.json().await?;
+    assert_eq!(det["instance"]["status"], "archived");
+
+    // 9. Delete archived clone
+    let resp = client
+        .delete(format!("{base_url}/api/instances/lifecycle-clone"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+
+    // 10. Include archived now shows 1
+    let resp = client
+        .get(format!("{base_url}/api/instances?include_archived=true"))
+        .send()
+        .await?;
+    let list: Vec<serde_json::Value> = resp.json().await?;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["name"], "lifecycle-test");
+
+    // 11. Unarchive on active instance returns 409 (active name conflict with itself)
+    let resp = client
+        .post(format!("{base_url}/api/instances/lifecycle-test/unarchive"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 409);
+
+    // 12. Archive original, then unarchive
+    client
+        .post(format!("{base_url}/api/instances/lifecycle-test/archive"))
+        .send()
+        .await?;
+    let resp = client
+        .post(format!("{base_url}/api/instances/lifecycle-test/unarchive"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+
+    // 13. Back in active list
+    let resp = client
+        .get(format!("{base_url}/api/instances"))
+        .send()
+        .await?;
+    let list: Vec<serde_json::Value> = resp.json().await?;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["name"], "lifecycle-test");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn archived_instances_sorted_after_active() -> Result<()> {
+    let (_tmp, db_path) = setup_cp();
+    let (base_url, _shutdown) = start_test_server(db_path).await;
+    let client = reqwest::Client::new();
+
+    // Create two instances
+    client
+        .post(format!("{base_url}/api/instances"))
+        .json(&serde_json::json!({ "name": "active-one" }))
+        .send()
+        .await?;
+    client
+        .post(format!("{base_url}/api/instances"))
+        .json(&serde_json::json!({ "name": "archived-one" }))
+        .send()
+        .await?;
+
+    // Archive one
+    client
+        .post(format!("{base_url}/api/instances/archived-one/archive"))
+        .send()
+        .await?;
+
+    // With include_archived, active should come first
+    let resp = client
+        .get(format!("{base_url}/api/instances?include_archived=true"))
+        .send()
+        .await?;
+    let list: Vec<serde_json::Value> = resp.json().await?;
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0]["name"], "active-one");
+    assert_eq!(list[0]["status"].as_str().unwrap() != "archived", true);
+    assert_eq!(list[1]["name"], "archived-one");
+    assert_eq!(list[1]["status"], "archived");
+
+    Ok(())
+}
