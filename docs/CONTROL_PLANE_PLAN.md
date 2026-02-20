@@ -10,7 +10,7 @@ Turn ZeroClaw CP from a migration tool into a full operator control plane: lifec
 - User authentication / multi-tenancy (single operator)
 - Auto-scaling or dynamic instance creation (operator-driven only)
 
-## Current State (Phase 6 - Complete)
+## Current State (Phase 13.5 - Complete)
 
 - `zeroclaw-cp migrate from-openclaw` imports agents from OpenClaw config
 - SQLite registry tracks instances (id, name, status, port, config_path, workspace_dir, archived_at, migration_run_id)
@@ -239,6 +239,69 @@ Turn ZeroClaw CP from a migration tool into a full operator control plane: lifec
 
 ---
 
+## Phase 13.1: Agent CRUD API (Complete)
+
+**Goal**: HTTP API to create, archive, unarchive, clone, and hard-delete agent instances -- making the CP a self-service platform without manual file manipulation.
+
+**Scope**:
+- `POST /api/instances` -- create with name, optional port/model/provider
+- `POST /api/instances/:name/archive` -- soft-delete (stops if running via live_status truth)
+- `POST /api/instances/:name/unarchive` -- restore archived instance (rejects active name conflict)
+- `POST /api/instances/:name/clone` -- independent copy with new UUID/port, cleared auth state
+- `DELETE /api/instances/:name` -- hard-delete archived instances only (two-step safety)
+- Name validation: `^[a-zA-Z0-9][a-zA-Z0-9-]{0,63}$`, unique among active
+- Port protection: unique index on active ports, auto-allocation 18801-18999 or explicit with 409 on conflict
+- Messages/message_events preserved on delete (Phase 10.2 append-only contract)
+
+**Exit gates** (all passed):
+1. POST creates bootable agent (config.toml + DB row + workspace dirs)
+2. Archive uses live_status() truth, stops if running, then soft-deletes
+3. Unarchive restores; rejects if active name conflict
+4. Clone produces independent copy with cleared auth
+5. Delete hard-deletes only archived (two-step safety), preserves messages
+6. Name validation enforced
+7. Port uniqueness via DB index, 409 on conflict
+8. 20 gate tests in `tests/phase13_gates.rs`
+9. Full test suite passes
+
+**Dependencies**: Phase 10.2 (for message preservation contract)
+
+---
+
+## Phase 13.5: CRUD UI (Complete)
+
+**Goal**: Add all Phase 13.1 CRUD operations to the embedded SPA with proper UX (confirmations, error feedback, auto-refresh).
+
+**Scope**:
+- Dashboard toolbar: "New Instance" button + "Show Archived" toggle
+- Create instance modal: name, port, provider, model fields
+- Clone instance modal: new name, port fields
+- Archive with confirmation dialog (warns about stopping running instance)
+- Unarchive (direct action, no confirmation needed)
+- Delete with "permanently delete?" confirmation dialog
+- Clean error rendering for 400/404/409 responses
+- `?include_archived=true` query param on `GET /api/instances`
+- Archived instance detail views (route, status, banner, action buttons)
+- Backend: `GET /instances/:name` and `/details` fall back to archived lookup
+- Archived cards visually distinct (dashed border, dimmed opacity)
+
+**Exit gates** (all passed):
+1. All 5 CRUD actions work from browser with confirmations
+2. 400/404/409 rendered as user-visible error notifications
+3. List/detail views auto-refresh after mutations
+4. 5 UI-flow gate tests (include_archived, get/details archived, full lifecycle, sort order)
+5. Full test suite passes (2,396 tests)
+
+**Dependencies**: Phase 13.1
+
+---
+
+## Phase 14: Real-Time WebSocket Streams
+
+See `docs/PHASE14_WEBSOCKET_SPEC.md` for full specification.
+
+---
+
 ## Risk Register
 
 | Risk | Mitigation |
@@ -253,3 +316,7 @@ Turn ZeroClaw CP from a migration tool into a full operator control plane: lifec
 | Inter-agent message loops | Phase 10.1: hop limit (8) + duplicate suppression via idempotency key |
 | Message queue unbounded growth | Phase 10.1: TTL expiry + dead-letter terminal state |
 | Secret leakage in message payloads | Phase 10.1: redact known patterns before persistence, not just at render |
+| Accidental hard-delete of active instance | Phase 13.1: two-step safety (archive first), 409 on active delete |
+| Port conflict on create/clone | Phase 13.1: unique active-port index, 409 on SQLite constraint violation |
+| Orphaned files after failed create/clone | Phase 13.1: cleanup-on-error removes inst_dir on any failure after mkdir |
+| Polling overhead on dashboard | Phase 14: WebSocket push replaces 5s polling intervals |
