@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::cp::masking::redact_payload_secrets;
 use crate::cp::server::CpState;
-use crate::db::{NewMessage, Registry};
+use crate::db::{MessageDirection, MessageFilters, NewMessage, Registry};
 use crate::lifecycle;
 
 type ApiResponse = (StatusCode, Json<serde_json::Value>);
@@ -484,6 +484,491 @@ pub async fn run_delivery_worker(
         }
     }
 }
+
+// ── Sanitization helpers (Phase 10.2) ─────────────────────────
+
+fn sanitize_message_for_response(msg: &crate::db::Message) -> serde_json::Value {
+    let mut payload: serde_json::Value = serde_json::from_str(&msg.payload)
+        .unwrap_or(serde_json::Value::String(msg.payload.clone()));
+    redact_payload_secrets(&mut payload);
+    serde_json::json!({
+        "id": msg.id,
+        "from_instance": msg.from_instance,
+        "to_instance": msg.to_instance,
+        "type": msg.message_type,
+        "payload": payload,
+        "correlation_id": msg.correlation_id,
+        "hop_count": msg.hop_count,
+        "status": msg.status,
+        "retry_count": msg.retry_count,
+        "max_retries": msg.max_retries,
+        "next_attempt_at": msg.next_attempt_at,
+        "lease_expires_at": msg.lease_expires_at,
+        "expires_at": msg.expires_at,
+        "created_at": msg.created_at,
+        "updated_at": msg.updated_at,
+    })
+}
+
+fn sanitize_event_for_response(evt: &crate::db::MessageEvent) -> serde_json::Value {
+    serde_json::json!({
+        "id": evt.id,
+        "message_id": evt.message_id,
+        "event_type": evt.event_type,
+        "detail": evt.detail,
+        "created_at": evt.created_at,
+    })
+}
+
+/// Validate a datetime string matches the canonical format.
+fn validate_datetime(value: &str, param_name: &str) -> Result<(), (StatusCode, String)> {
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Invalid datetime format for '{}': expected YYYY-MM-DD HH:MM:SS",
+                param_name
+            ),
+        )
+    })?;
+    Ok(())
+}
+
+// ── Observability query param structs ─────────────────────────
+
+#[derive(Deserialize)]
+pub struct MessagesQuery {
+    pub correlation_id: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    #[serde(rename = "type")]
+    pub message_type: Option<String>,
+    pub status: Option<String>,
+    pub after: Option<String>,
+    pub before: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub struct InstanceMessagesQuery {
+    pub direction: Option<String>,
+    pub status: Option<String>,
+    #[serde(rename = "type")]
+    pub message_type: Option<String>,
+    pub after: Option<String>,
+    pub before: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub struct DeadLetterQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub after: Option<String>,
+    pub before: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+const VALID_STATUSES: &[&str] = &["queued", "leased", "acknowledged", "dead_letter"];
+
+// ── GET /api/messages/:id ─────────────────────────────────────
+
+pub async fn handle_get_message(
+    State(state): State<CpState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<serde_json::Value, (StatusCode, String)> {
+            let registry = Registry::open(&db_path)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+            let msg = registry
+                .get_message(&id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("No message with id '{id}'")))?;
+
+            let events = registry
+                .get_message_events(&id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+            let mut msg_json = sanitize_message_for_response(&msg);
+            msg_json["events"] =
+                serde_json::Value::Array(events.iter().map(sanitize_event_for_response).collect());
+
+            Ok(msg_json)
+        })
+        .await;
+
+    match result {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err((status, msg))) => err_json(status, &msg),
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── GET /api/messages/:id/events ──────────────────────────────
+
+pub async fn handle_get_message_events(
+    State(state): State<CpState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<serde_json::Value, (StatusCode, String)> {
+            let registry = Registry::open(&db_path)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+            // Verify message exists
+            registry
+                .get_message(&id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("No message with id '{id}'")))?;
+
+            let events = registry
+                .get_message_events(&id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+            Ok(serde_json::json!({
+                "message_id": id,
+                "events": events.iter().map(sanitize_event_for_response).collect::<Vec<_>>(),
+            }))
+        })
+        .await;
+
+    match result {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err((status, msg))) => err_json(status, &msg),
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── GET /api/messages ─────────────────────────────────────────
+
+pub async fn handle_list_messages(
+    State(state): State<CpState>,
+    Query(query): Query<MessagesQuery>,
+) -> ApiResponse {
+    // Validate params
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=1000).contains(&limit) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "Invalid limit: must be between 1 and 1000",
+        );
+    }
+    let offset = query.offset.unwrap_or(0);
+    if offset > 100_000 {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "Invalid offset: must be at most 100000",
+        );
+    }
+    if let Some(ref status) = query.status {
+        if !VALID_STATUSES.contains(&status.as_str()) {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Invalid status: '{}'. Valid values: queued, leased, acknowledged, dead_letter",
+                    status
+                ),
+            );
+        }
+    }
+    if let Some(ref after) = query.after {
+        if let Err((status, msg)) = validate_datetime(after, "after") {
+            return err_json(status, &msg);
+        }
+    }
+    if let Some(ref before) = query.before {
+        if let Err((status, msg)) = validate_datetime(before, "before") {
+            return err_json(status, &msg);
+        }
+    }
+
+    let db_path = state.db_path.clone();
+    let filters = MessageFilters {
+        correlation_id: query.correlation_id,
+        from_instance: query.from,
+        to_instance: query.to,
+        message_type: query.message_type,
+        status: query.status,
+        after: query.after,
+        before: query.before,
+        limit,
+        offset,
+    };
+
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<serde_json::Value, (StatusCode, String)> {
+            let registry = Registry::open(&db_path)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+            let (messages, total) = registry
+                .list_messages(&filters)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+            let items: Vec<serde_json::Value> =
+                messages.iter().map(sanitize_message_for_response).collect();
+
+            Ok(serde_json::json!({
+                "items": items,
+                "total": total,
+                "limit": filters.limit,
+                "offset": filters.offset,
+            }))
+        })
+        .await;
+
+    match result {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err((status, msg))) => err_json(status, &msg),
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── GET /api/instances/:name/messages ─────────────────────────
+
+pub async fn handle_list_instance_messages(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+    Query(query): Query<InstanceMessagesQuery>,
+) -> ApiResponse {
+    // Validate params
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=1000).contains(&limit) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "Invalid limit: must be between 1 and 1000",
+        );
+    }
+    let offset = query.offset.unwrap_or(0);
+    if offset > 100_000 {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "Invalid offset: must be at most 100000",
+        );
+    }
+
+    let direction_str = query.direction.as_deref().unwrap_or("all").to_string();
+    let direction = match direction_str.as_str() {
+        "in" => MessageDirection::In,
+        "out" => MessageDirection::Out,
+        "all" => MessageDirection::All,
+        _ => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Invalid direction: '{}'. Valid values: in, out, all",
+                    direction_str
+                ),
+            );
+        }
+    };
+
+    if let Some(ref status) = query.status {
+        if !VALID_STATUSES.contains(&status.as_str()) {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Invalid status: '{}'. Valid values: queued, leased, acknowledged, dead_letter",
+                    status
+                ),
+            );
+        }
+    }
+    if let Some(ref after) = query.after {
+        if let Err((status, msg)) = validate_datetime(after, "after") {
+            return err_json(status, &msg);
+        }
+    }
+    if let Some(ref before) = query.before {
+        if let Err((status, msg)) = validate_datetime(before, "before") {
+            return err_json(status, &msg);
+        }
+    }
+
+    let db_path = state.db_path.clone();
+    let filters = MessageFilters {
+        correlation_id: None,
+        from_instance: None,
+        to_instance: None,
+        message_type: query.message_type,
+        status: query.status,
+        after: query.after,
+        before: query.before,
+        limit,
+        offset,
+    };
+
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<serde_json::Value, (StatusCode, String)> {
+            let registry = Registry::open(&db_path)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+            // Verify instance exists
+            registry
+                .get_instance_by_name(&name)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("No instance named '{name}'")))?;
+
+            let (messages, total) = registry
+                .list_messages_for_instance(&name, direction, &filters)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+            let items: Vec<serde_json::Value> =
+                messages.iter().map(sanitize_message_for_response).collect();
+
+            Ok(serde_json::json!({
+                "instance": name,
+                "direction": direction_str,
+                "items": items,
+                "total": total,
+                "limit": filters.limit,
+                "offset": filters.offset,
+            }))
+        })
+        .await;
+
+    match result {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err((status, msg))) => err_json(status, &msg),
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── GET /api/messages/dead-letter ─────────────────────────────
+
+pub async fn handle_list_dead_letter(
+    State(state): State<CpState>,
+    Query(query): Query<DeadLetterQuery>,
+) -> ApiResponse {
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=1000).contains(&limit) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "Invalid limit: must be between 1 and 1000",
+        );
+    }
+    let offset = query.offset.unwrap_or(0);
+    if offset > 100_000 {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "Invalid offset: must be at most 100000",
+        );
+    }
+    if let Some(ref after) = query.after {
+        if let Err((status, msg)) = validate_datetime(after, "after") {
+            return err_json(status, &msg);
+        }
+    }
+    if let Some(ref before) = query.before {
+        if let Err((status, msg)) = validate_datetime(before, "before") {
+            return err_json(status, &msg);
+        }
+    }
+
+    let db_path = state.db_path.clone();
+    let filters = MessageFilters {
+        correlation_id: None,
+        from_instance: query.from,
+        to_instance: query.to,
+        message_type: None,
+        status: None,
+        after: query.after,
+        before: query.before,
+        limit,
+        offset,
+    };
+
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<serde_json::Value, (StatusCode, String)> {
+            let registry = Registry::open(&db_path)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+            let (messages, total) = registry
+                .list_dead_letter_messages(&filters)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+            let items: Vec<serde_json::Value> =
+                messages.iter().map(sanitize_message_for_response).collect();
+
+            Ok(serde_json::json!({
+                "items": items,
+                "total": total,
+                "limit": filters.limit,
+                "offset": filters.offset,
+            }))
+        })
+        .await;
+
+    match result {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err((status, msg))) => err_json(status, &msg),
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── POST /api/messages/:id/replay ─────────────────────────────
+
+pub async fn handle_replay_message(
+    State(state): State<CpState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<serde_json::Value, (StatusCode, String)> {
+            let registry = Registry::open(&db_path)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+            match registry.replay_message(&id) {
+                Ok(msg) => Ok(sanitize_message_for_response(&msg)),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if msg.contains("not found") || msg.contains("Message not found") {
+                        Err((StatusCode::NOT_FOUND, format!("No message with id '{id}'")))
+                    } else if msg.contains("expected 'dead_letter'") {
+                        Err((
+                            StatusCode::CONFLICT,
+                            format!("Message '{id}' is not in dead_letter status"),
+                        ))
+                    } else {
+                        Err((StatusCode::INTERNAL_SERVER_ERROR, msg))
+                    }
+                }
+            }
+        })
+        .await;
+
+    match result {
+        Ok(Ok(value)) => ok_json(value),
+        Ok(Err((status, msg))) => err_json(status, &msg),
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── Delivery worker ──────────────────────────────────────────────
 
 fn delivery_tick(db_path: &Path) -> anyhow::Result<()> {
     let registry = Registry::open(db_path)?;

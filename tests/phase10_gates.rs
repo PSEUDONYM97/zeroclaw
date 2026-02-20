@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -618,6 +619,673 @@ async fn long_poll_timeout_returns_null() -> Result<()> {
     assert!(
         elapsed >= std::time::Duration::from_secs(1),
         "should wait at least 1 second"
+    );
+
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Gate 8: Chronological event ordering
+// ══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn gate8_chronological_event_ordering() -> Result<()> {
+    let (_tmp, db_path) = setup_two_instances();
+    let (base_url, _shutdown) = start_test_server(db_path.clone()).await;
+    let client = reqwest::Client::new();
+
+    // Create routing rule
+    client
+        .post(format!("{base_url}/api/routing-rules"))
+        .json(&serde_json::json!({
+            "from_instance": "agent-a",
+            "to_instance": "agent-b",
+            "type_pattern": "*",
+        }))
+        .send()
+        .await?;
+
+    // Send message
+    let send_resp = client
+        .post(format!("{base_url}/api/messages"))
+        .json(&serde_json::json!({
+            "from_instance": "agent-a",
+            "to_instance": "agent-b",
+            "type": "task.handoff",
+            "payload": {"text": "event ordering test"},
+        }))
+        .send()
+        .await?;
+    let send_body: serde_json::Value = send_resp.json().await?;
+    let msg_id = send_body["id"].as_str().unwrap().to_string();
+
+    // Receive (leases the message)
+    let recv_resp = client
+        .get(format!(
+            "{base_url}/api/instances/agent-b/messages/pending?wait=1"
+        ))
+        .send()
+        .await?;
+    let recv_body: serde_json::Value = recv_resp.json().await?;
+    assert!(!recv_body["message"].is_null());
+
+    // Acknowledge
+    client
+        .post(format!("{base_url}/api/messages/{msg_id}/acknowledge"))
+        .send()
+        .await?;
+
+    // GET /messages/:id/events
+    let events_resp = client
+        .get(format!("{base_url}/api/messages/{msg_id}/events"))
+        .send()
+        .await?;
+    assert_eq!(events_resp.status(), 200);
+    let events_body: serde_json::Value = events_resp.json().await?;
+    let events = events_body["events"].as_array().unwrap();
+
+    assert!(
+        events.len() >= 3,
+        "expected at least 3 events (created, leased, acknowledged), got {}",
+        events.len()
+    );
+
+    // Verify chronological ordering: created_at non-decreasing, id strictly ascending
+    for i in 1..events.len() {
+        let prev_ts = events[i - 1]["created_at"].as_str().unwrap();
+        let curr_ts = events[i]["created_at"].as_str().unwrap();
+        assert!(
+            curr_ts >= prev_ts,
+            "events should be in chronological order: {} >= {}",
+            curr_ts,
+            prev_ts
+        );
+
+        let prev_id = events[i - 1]["id"].as_i64().unwrap();
+        let curr_id = events[i]["id"].as_i64().unwrap();
+        assert!(
+            curr_id > prev_id,
+            "event IDs should be strictly ascending: {} > {}",
+            curr_id,
+            prev_id
+        );
+    }
+
+    // Verify event type sequence
+    assert_eq!(events[0]["event_type"].as_str().unwrap(), "created");
+    assert_eq!(events[1]["event_type"].as_str().unwrap(), "leased");
+    assert_eq!(events[2]["event_type"].as_str().unwrap(), "acknowledged");
+
+    // Also verify GET /messages/:id includes events
+    let msg_resp = client
+        .get(format!("{base_url}/api/messages/{msg_id}"))
+        .send()
+        .await?;
+    assert_eq!(msg_resp.status(), 200);
+    let msg_body: serde_json::Value = msg_resp.json().await?;
+    assert!(msg_body["events"].as_array().unwrap().len() >= 3);
+
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Gate 9: Replay behavior
+// ══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn gate9_replay_behavior() -> Result<()> {
+    let (_tmp, db_path) = setup_two_instances();
+    let (base_url, _shutdown) = start_test_server(db_path.clone()).await;
+    let client = reqwest::Client::new();
+
+    // Create routing rule
+    client
+        .post(format!("{base_url}/api/routing-rules"))
+        .json(&serde_json::json!({
+            "from_instance": "agent-a",
+            "to_instance": "agent-b",
+            "type_pattern": "*",
+        }))
+        .send()
+        .await?;
+
+    // Send message
+    let send_resp = client
+        .post(format!("{base_url}/api/messages"))
+        .json(&serde_json::json!({
+            "from_instance": "agent-a",
+            "to_instance": "agent-b",
+            "type": "task",
+            "payload": {"text": "replay test"},
+        }))
+        .send()
+        .await?;
+    let send_body: serde_json::Value = send_resp.json().await?;
+    let msg_id = send_body["id"].as_str().unwrap().to_string();
+
+    // Dead-letter it via direct DB
+    {
+        let registry = Registry::open(&db_path)?;
+        registry.dead_letter_message(&msg_id, "test dead letter")?;
+    }
+
+    // POST /messages/:id/replay -> 200
+    let replay_resp = client
+        .post(format!("{base_url}/api/messages/{msg_id}/replay"))
+        .send()
+        .await?;
+    assert_eq!(replay_resp.status(), 200, "replay should return 200");
+    let replay_body: serde_json::Value = replay_resp.json().await?;
+    assert_eq!(replay_body["status"].as_str().unwrap(), "queued");
+    assert_eq!(replay_body["retry_count"].as_i64().unwrap(), 0);
+    assert!(replay_body["next_attempt_at"].is_null());
+    assert!(replay_body["lease_expires_at"].is_null());
+
+    // GET /messages/:id/events -> last two events are replayed, queued
+    let events_resp = client
+        .get(format!("{base_url}/api/messages/{msg_id}/events"))
+        .send()
+        .await?;
+    let events_body: serde_json::Value = events_resp.json().await?;
+    let events = events_body["events"].as_array().unwrap();
+    let len = events.len();
+    assert!(len >= 2);
+    assert_eq!(events[len - 2]["event_type"].as_str().unwrap(), "replayed");
+    assert_eq!(events[len - 1]["event_type"].as_str().unwrap(), "queued");
+
+    // POST replay again on now-queued message -> 409 Conflict
+    let replay2_resp = client
+        .post(format!("{base_url}/api/messages/{msg_id}/replay"))
+        .send()
+        .await?;
+    assert_eq!(
+        replay2_resp.status(),
+        409,
+        "replay on queued message should return 409"
+    );
+
+    // POST replay on nonexistent ID -> 404
+    let replay3_resp = client
+        .post(format!("{base_url}/api/messages/nonexistent-id/replay"))
+        .send()
+        .await?;
+    assert_eq!(
+        replay3_resp.status(),
+        404,
+        "replay on nonexistent message should return 404"
+    );
+
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Gate 10: Pagination correctness
+// ══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn gate10_pagination_correctness() -> Result<()> {
+    let (_tmp, db_path) = setup_two_instances();
+    let (base_url, _shutdown) = start_test_server(db_path.clone()).await;
+    let client = reqwest::Client::new();
+
+    // Create routing rule
+    client
+        .post(format!("{base_url}/api/routing-rules"))
+        .json(&serde_json::json!({
+            "from_instance": "agent-a",
+            "to_instance": "agent-b",
+            "type_pattern": "*",
+        }))
+        .send()
+        .await?;
+
+    // Enqueue 5 messages
+    for i in 0..5 {
+        client
+            .post(format!("{base_url}/api/messages"))
+            .json(&serde_json::json!({
+                "from_instance": "agent-a",
+                "to_instance": "agent-b",
+                "type": "task",
+                "payload": {"index": i},
+            }))
+            .send()
+            .await?;
+    }
+
+    // Page 1: limit=2, offset=0
+    let page1 = client
+        .get(format!("{base_url}/api/messages?limit=2&offset=0"))
+        .send()
+        .await?;
+    assert_eq!(page1.status(), 200);
+    let page1_body: serde_json::Value = page1.json().await?;
+    assert_eq!(page1_body["items"].as_array().unwrap().len(), 2);
+    assert_eq!(page1_body["total"].as_i64().unwrap(), 5);
+
+    // Page 2: limit=2, offset=2
+    let page2 = client
+        .get(format!("{base_url}/api/messages?limit=2&offset=2"))
+        .send()
+        .await?;
+    let page2_body: serde_json::Value = page2.json().await?;
+    assert_eq!(page2_body["items"].as_array().unwrap().len(), 2);
+
+    // Page 3: limit=2, offset=4
+    let page3 = client
+        .get(format!("{base_url}/api/messages?limit=2&offset=4"))
+        .send()
+        .await?;
+    let page3_body: serde_json::Value = page3.json().await?;
+    assert_eq!(page3_body["items"].as_array().unwrap().len(), 1);
+
+    // Collect all IDs, assert no duplicates and total = 5
+    let mut all_ids: Vec<String> = Vec::new();
+    for page_body in [&page1_body, &page2_body, &page3_body] {
+        for item in page_body["items"].as_array().unwrap() {
+            all_ids.push(item["id"].as_str().unwrap().to_string());
+        }
+    }
+    let unique_ids: HashSet<&String> = all_ids.iter().collect();
+    assert_eq!(all_ids.len(), 5, "should have 5 total items across pages");
+    assert_eq!(
+        unique_ids.len(),
+        5,
+        "all IDs should be unique (no duplicates)"
+    );
+
+    // Invalid limit=0 -> 400
+    let bad_limit = client
+        .get(format!("{base_url}/api/messages?limit=0"))
+        .send()
+        .await?;
+    assert_eq!(bad_limit.status(), 400);
+
+    // Invalid offset=200000 -> 400
+    let bad_offset = client
+        .get(format!("{base_url}/api/messages?offset=200000"))
+        .send()
+        .await?;
+    assert_eq!(bad_offset.status(), 400);
+
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Gate 11: No raw secret leak on read path
+// ══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn gate11_no_raw_secret_leak_on_read_path() -> Result<()> {
+    let (_tmp, db_path) = setup_two_instances();
+    let (base_url, _shutdown) = start_test_server(db_path.clone()).await;
+    let client = reqwest::Client::new();
+
+    // Create routing rule
+    client
+        .post(format!("{base_url}/api/routing-rules"))
+        .json(&serde_json::json!({
+            "from_instance": "agent-a",
+            "to_instance": "agent-b",
+            "type_pattern": "*",
+        }))
+        .send()
+        .await?;
+
+    let raw_secret = "sk-real-secret-12345";
+
+    // Send message with secrets in payload
+    let send_resp = client
+        .post(format!("{base_url}/api/messages"))
+        .json(&serde_json::json!({
+            "from_instance": "agent-a",
+            "to_instance": "agent-b",
+            "type": "config",
+            "payload": {
+                "api_key": raw_secret,
+                "nested": {"token": raw_secret},
+                "safe": "visible",
+            },
+        }))
+        .send()
+        .await?;
+    assert_eq!(send_resp.status(), 201);
+    let send_body: serde_json::Value = send_resp.json().await?;
+    let msg_id = send_body["id"].as_str().unwrap().to_string();
+
+    // Helper: check that a response body string does not contain the raw secret
+    fn assert_no_secret(body: &str, context: &str) {
+        assert!(
+            !body.contains("sk-real-secret-12345"),
+            "raw secret leaked in {context}"
+        );
+    }
+
+    // GET /messages/:id
+    let msg_resp = client
+        .get(format!("{base_url}/api/messages/{msg_id}"))
+        .send()
+        .await?;
+    assert_eq!(msg_resp.status(), 200);
+    let msg_text = msg_resp.text().await?;
+    assert_no_secret(&msg_text, "GET /messages/:id");
+
+    // GET /messages
+    let list_resp = client
+        .get(format!("{base_url}/api/messages"))
+        .send()
+        .await?;
+    let list_text = list_resp.text().await?;
+    assert_no_secret(&list_text, "GET /messages");
+
+    // GET /instances/:name/messages?direction=in
+    let inst_resp = client
+        .get(format!(
+            "{base_url}/api/instances/agent-b/messages?direction=in"
+        ))
+        .send()
+        .await?;
+    let inst_text = inst_resp.text().await?;
+    assert_no_secret(&inst_text, "GET /instances/:name/messages");
+
+    // Dead-letter and replay, check replay response
+    {
+        let registry = Registry::open(&db_path)?;
+        registry.dead_letter_message(&msg_id, "test")?;
+    }
+
+    let replay_resp = client
+        .post(format!("{base_url}/api/messages/{msg_id}/replay"))
+        .send()
+        .await?;
+    let replay_text = replay_resp.text().await?;
+    assert_no_secret(&replay_text, "POST /messages/:id/replay");
+
+    // Verify DB storage has redacted values (ingest redaction)
+    {
+        let registry = Registry::open(&db_path)?;
+        let msg = registry.get_message(&msg_id)?.unwrap();
+        assert!(
+            !msg.payload.contains("sk-real-secret-12345"),
+            "raw secret should not be in DB payload"
+        );
+        assert!(
+            msg.payload.contains("***REDACTED***"),
+            "DB payload should contain redaction sentinel"
+        );
+    }
+
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Gate 12: Inbox/outbox direction filtering
+// ══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn gate12_inbox_outbox_direction_filtering() -> Result<()> {
+    let (_tmp, db_path) = setup_two_instances();
+    let (base_url, _shutdown) = start_test_server(db_path.clone()).await;
+    let client = reqwest::Client::new();
+
+    // Create routing rule A -> B
+    client
+        .post(format!("{base_url}/api/routing-rules"))
+        .json(&serde_json::json!({
+            "from_instance": "agent-a",
+            "to_instance": "agent-b",
+            "type_pattern": "*",
+        }))
+        .send()
+        .await?;
+
+    // Send message A -> B
+    client
+        .post(format!("{base_url}/api/messages"))
+        .json(&serde_json::json!({
+            "from_instance": "agent-a",
+            "to_instance": "agent-b",
+            "type": "task",
+            "payload": {"text": "direction test"},
+        }))
+        .send()
+        .await?;
+
+    // GET /instances/agent-a/messages?direction=out -> 1 item
+    let out_resp = client
+        .get(format!(
+            "{base_url}/api/instances/agent-a/messages?direction=out"
+        ))
+        .send()
+        .await?;
+    assert_eq!(out_resp.status(), 200);
+    let out_body: serde_json::Value = out_resp.json().await?;
+    assert_eq!(out_body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        out_body["items"][0]["from_instance"].as_str().unwrap(),
+        "agent-a"
+    );
+
+    // GET /instances/agent-a/messages?direction=in -> 0 items
+    let in_resp = client
+        .get(format!(
+            "{base_url}/api/instances/agent-a/messages?direction=in"
+        ))
+        .send()
+        .await?;
+    let in_body: serde_json::Value = in_resp.json().await?;
+    assert_eq!(in_body["items"].as_array().unwrap().len(), 0);
+
+    // GET /instances/agent-b/messages?direction=in -> 1 item
+    let b_in_resp = client
+        .get(format!(
+            "{base_url}/api/instances/agent-b/messages?direction=in"
+        ))
+        .send()
+        .await?;
+    let b_in_body: serde_json::Value = b_in_resp.json().await?;
+    assert_eq!(b_in_body["items"].as_array().unwrap().len(), 1);
+
+    // GET /instances/agent-a/messages?direction=all -> 1 item
+    let all_resp = client
+        .get(format!(
+            "{base_url}/api/instances/agent-a/messages?direction=all"
+        ))
+        .send()
+        .await?;
+    let all_body: serde_json::Value = all_resp.json().await?;
+    assert_eq!(all_body["items"].as_array().unwrap().len(), 1);
+
+    // Invalid direction -> 400
+    let bad_dir = client
+        .get(format!(
+            "{base_url}/api/instances/agent-a/messages?direction=invalid"
+        ))
+        .send()
+        .await?;
+    assert_eq!(bad_dir.status(), 400);
+
+    // Nonexistent instance -> 404
+    let no_inst = client
+        .get(format!(
+            "{base_url}/api/instances/nonexistent/messages?direction=in"
+        ))
+        .send()
+        .await?;
+    assert_eq!(no_inst.status(), 404);
+
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Gate 13: Append-only trigger enforcement
+// ══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn gate13_append_only_trigger_enforcement() -> Result<()> {
+    let (_tmp, db_path) = setup_two_instances();
+    let registry = Registry::open(&db_path)?;
+
+    // Create a routing rule and enqueue a message to get a valid message_id
+    registry.create_routing_rule("agent-a", "agent-b", "*", 5, 3600, false)?;
+    let msg = registry.enqueue_message(&zeroclaw::db::NewMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        from_instance: "agent-a".to_string(),
+        to_instance: "agent-b".to_string(),
+        message_type: "task".to_string(),
+        payload: r#"{"text":"trigger test"}"#.to_string(),
+        correlation_id: None,
+        idempotency_key: None,
+        hop_count: 0,
+        max_retries: 5,
+        ttl_secs: 3600,
+    })?;
+
+    // Insert a message event
+    registry.append_message_event(&msg.id, "created", Some("original detail"))?;
+
+    // Attempt UPDATE -> should fail
+    let update_result = registry.conn().execute(
+        "UPDATE message_events SET detail = 'tampered' WHERE message_id = ?1",
+        rusqlite::params![msg.id],
+    );
+    assert!(
+        update_result.is_err(),
+        "UPDATE on message_events should fail"
+    );
+    let update_err = update_result.unwrap_err().to_string();
+    assert!(
+        update_err.contains("append-only"),
+        "error should mention append-only, got: {update_err}"
+    );
+
+    // Attempt DELETE -> should fail
+    let delete_result = registry.conn().execute(
+        "DELETE FROM message_events WHERE message_id = ?1",
+        rusqlite::params![msg.id],
+    );
+    assert!(
+        delete_result.is_err(),
+        "DELETE on message_events should fail"
+    );
+    let delete_err = delete_result.unwrap_err().to_string();
+    assert!(
+        delete_err.contains("append-only"),
+        "error should mention append-only, got: {delete_err}"
+    );
+
+    // Verify original event is unchanged
+    let events = registry.get_message_events(&msg.id)?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].detail.as_deref(), Some("original detail"));
+
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Gate 14: Dead-letter endpoint + correlation filter
+// ══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn gate14_dead_letter_endpoint_and_correlation_filter() -> Result<()> {
+    let (_tmp, db_path) = setup_two_instances();
+    let (base_url, _shutdown) = start_test_server(db_path.clone()).await;
+    let client = reqwest::Client::new();
+
+    // Create routing rule
+    client
+        .post(format!("{base_url}/api/routing-rules"))
+        .json(&serde_json::json!({
+            "from_instance": "agent-a",
+            "to_instance": "agent-b",
+            "type_pattern": "*",
+        }))
+        .send()
+        .await?;
+
+    let corr_id = "corr-test-123";
+
+    // Send 2 messages: one with correlation_id, one without
+    let send1 = client
+        .post(format!("{base_url}/api/messages"))
+        .json(&serde_json::json!({
+            "from_instance": "agent-a",
+            "to_instance": "agent-b",
+            "type": "task",
+            "payload": {"text": "with correlation"},
+            "correlation_id": corr_id,
+        }))
+        .send()
+        .await?;
+    let send1_body: serde_json::Value = send1.json().await?;
+    let msg1_id = send1_body["id"].as_str().unwrap().to_string();
+
+    let send2 = client
+        .post(format!("{base_url}/api/messages"))
+        .json(&serde_json::json!({
+            "from_instance": "agent-a",
+            "to_instance": "agent-b",
+            "type": "task",
+            "payload": {"text": "without correlation"},
+        }))
+        .send()
+        .await?;
+    let send2_body: serde_json::Value = send2.json().await?;
+    let msg2_id = send2_body["id"].as_str().unwrap().to_string();
+
+    // Dead-letter both via direct DB
+    {
+        let registry = Registry::open(&db_path)?;
+        registry.dead_letter_message(&msg1_id, "test")?;
+        registry.dead_letter_message(&msg2_id, "test")?;
+    }
+
+    // GET /messages/dead-letter -> total=2
+    let dl_resp = client
+        .get(format!("{base_url}/api/messages/dead-letter"))
+        .send()
+        .await?;
+    assert_eq!(dl_resp.status(), 200);
+    let dl_body: serde_json::Value = dl_resp.json().await?;
+    assert_eq!(dl_body["total"].as_i64().unwrap(), 2);
+
+    // GET /messages?correlation_id=X -> 1 item, correct ID
+    let corr_resp = client
+        .get(format!("{base_url}/api/messages?correlation_id={corr_id}"))
+        .send()
+        .await?;
+    let corr_body: serde_json::Value = corr_resp.json().await?;
+    assert_eq!(corr_body["total"].as_i64().unwrap(), 1);
+    assert_eq!(
+        corr_body["items"][0]["id"].as_str().unwrap(),
+        msg1_id,
+        "correlation filter should return the correct message"
+    );
+
+    // GET /messages?status=dead_letter -> total=2
+    let status_resp = client
+        .get(format!("{base_url}/api/messages?status=dead_letter"))
+        .send()
+        .await?;
+    let status_body: serde_json::Value = status_resp.json().await?;
+    assert_eq!(status_body["total"].as_i64().unwrap(), 2);
+
+    // Replay one, verify dead-letter count drops
+    let replay_resp = client
+        .post(format!("{base_url}/api/messages/{msg1_id}/replay"))
+        .send()
+        .await?;
+    assert_eq!(replay_resp.status(), 200);
+
+    let dl_resp2 = client
+        .get(format!("{base_url}/api/messages/dead-letter"))
+        .send()
+        .await?;
+    let dl_body2: serde_json::Value = dl_resp2.json().await?;
+    assert_eq!(
+        dl_body2["total"].as_i64().unwrap(),
+        1,
+        "after replaying one, dead-letter count should be 1"
     );
 
     Ok(())

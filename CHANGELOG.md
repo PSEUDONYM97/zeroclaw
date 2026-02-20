@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 10.2 - Messaging Observability)
+
+- **GET /api/messages** - Filtered search across all messages with pagination. Supports
+  `correlation_id`, `from`, `to`, `type`, `status`, `after`, `before`, `limit`, `offset`.
+  Returns `{ items, total, limit, offset }`.
+- **GET /api/messages/:id** - Single message detail with full state transition history.
+  Returns the sanitized message object plus an `events` array (chronological).
+- **GET /api/messages/:id/events** - Event timeline for a message. Events sorted by
+  `created_at ASC, id ASC`. Returns `{ message_id, events }`.
+- **GET /api/messages/dead-letter** - Dead-letter queue browser. Sorted by `updated_at DESC`
+  (most recently dead-lettered first). Supports `from`, `to`, `after`, `before` filters.
+- **POST /api/messages/:id/replay** - Replay a dead-lettered message. Resets status to
+  `queued`, retry_count to 0, clears lease/attempt timestamps, computes fresh TTL from
+  original `expires_at - created_at` (clamped 5m..24h, fallback 1h). Appends `replayed`
+  and `queued` events atomically. Returns 200 (success), 404 (not found), 409 (not dead_letter).
+- **GET /api/instances/:name/messages** - Per-instance inbox/outbox. `direction` param
+  controls filtering: `in` (to_instance), `out` (from_instance), `all` (either). Returns 404
+  if instance does not exist.
+- **Append-only audit enforcement** - DB triggers prevent UPDATE and DELETE on `message_events`.
+  Any attempt raises "message_events is append-only" error.
+- **Defense-in-depth secret redaction** - All 6 new read-path handlers pass payloads through
+  `redact_payload_secrets()` before response, even though ingest already redacts. Verified
+  end-to-end: raw secrets never appear in API responses or DB storage.
+- **4 new DB indexes** - `idx_messages_from_status`, `idx_messages_created_at`,
+  `idx_messages_status`, `idx_message_events_msg_created` for observability query performance.
+- **Datetime validation** - All `after`/`before` query params require canonical
+  `YYYY-MM-DD HH:MM:SS` format. Returns 400 with descriptive error on parse failure.
+
 ### Security
 - **Legacy XOR cipher migration**: The `enc:` prefix (XOR cipher) is now deprecated. 
   Secrets using this format will be automatically migrated to `enc2:` (ChaCha20-Poly1305 AEAD)
