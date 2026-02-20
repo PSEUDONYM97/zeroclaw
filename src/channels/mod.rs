@@ -7,6 +7,7 @@ pub mod irc;
 pub mod matrix;
 pub mod slack;
 pub mod telegram;
+pub mod telegram_types;
 pub mod traits;
 pub mod whatsapp;
 
@@ -19,6 +20,7 @@ pub use irc::IrcChannel;
 pub use matrix::MatrixChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
+pub use telegram_types::TelegramToolContext;
 pub use traits::Channel;
 pub use whatsapp::WhatsAppChannel;
 
@@ -523,13 +525,31 @@ pub async fn start_channels(config: Config) -> Result<()> {
     } else {
         None
     };
-    let tools_registry = tools::all_tools_with_runtime(
+    let mut tools_registry = tools::all_tools_with_runtime(
         &security,
         runtime_adapter,
         mem.clone(),
         composio_key,
         &config.browser,
     );
+
+    // Shared context for Telegram tools (set before each agent_turn)
+    let telegram_context: Arc<std::sync::Mutex<Option<TelegramToolContext>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    // Conditionally register Telegram tools
+    let telegram_channel_arc: Option<Arc<TelegramChannel>> =
+        if let Some(ref tg) = config.channels_config.telegram {
+            let mut ch = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone());
+            if let Some(ref endpoint) = tg.stt_endpoint {
+                ch = ch.with_stt(endpoint.clone());
+            }
+            let arc = Arc::new(ch);
+            tools_registry.extend(tools::telegram_tools(arc.clone(), telegram_context.clone()));
+            Some(arc)
+        } else {
+            None
+        };
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -566,6 +586,21 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ));
     }
 
+    if config.channels_config.telegram.is_some() {
+        tool_descs.push((
+            "telegram_send_keyboard",
+            "Send a Telegram message with inline keyboard buttons (auto-resolves chat_id from context)",
+        ));
+        tool_descs.push((
+            "telegram_send_poll",
+            "Send a poll to a Telegram chat (auto-resolves chat_id from context)",
+        ));
+        tool_descs.push((
+            "telegram_edit_message",
+            "Edit an existing Telegram message's text and keyboard (auto-resolves chat_id from context)",
+        ));
+    }
+
     let mut system_prompt = build_system_prompt(
         &workspace,
         &model,
@@ -591,11 +626,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Collect active channels
     let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
 
-    if let Some(ref tg) = config.channels_config.telegram {
-        channels.push(Arc::new(TelegramChannel::new(
-            tg.bot_token.clone(),
-            tg.allowed_users.clone(),
-        )));
+    if let Some(ref _tg) = config.channels_config.telegram {
+        if let Some(ref tg_arc) = telegram_channel_arc {
+            channels.push(tg_arc.clone());
+        }
     }
 
     if let Some(ref dc) = config.channels_config.discord {
@@ -738,18 +772,69 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 .await;
         }
 
+        // Set Telegram tool context (so tools can resolve chat_id)
+        if msg.channel == "telegram" {
+            if let Ok(mut guard) = telegram_context.lock() {
+                *guard = Some(TelegramToolContext {
+                    chat_id: msg.sender.clone(),
+                    channel: "telegram".into(),
+                });
+            }
+        }
+
         // Get or create conversation history for this sender
         let sender_key = format!("{}:{}", msg.channel, msg.sender);
         let history = histories
             .entry(sender_key)
             .or_insert_with(|| vec![ChatMessage::system(&system_prompt)]);
 
-        // Inject memory context into user message
-        let context = crate::agent::build_context(mem.as_ref(), &msg.content).await;
-        let enriched = if context.is_empty() {
-            msg.content.clone()
+        // Build channel context prefix for the agent
+        let channel_context = if msg.channel == "telegram" {
+            let msg_type = msg
+                .metadata
+                .get("msg_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("text");
+            let reply_suffix = msg
+                .metadata
+                .get("original_message_id")
+                .map(|id| format!(", reply_to_msg_id={id}"))
+                .unwrap_or_default();
+            format!(
+                "[Channel context: telegram, chat_id={}, msg_type={msg_type}{reply_suffix}]\n",
+                msg.sender
+            )
         } else {
-            format!("{context}{}", msg.content)
+            String::new()
+        };
+
+        // Enrich callback queries with human-readable context
+        let user_content = if msg.channel == "telegram"
+            && msg
+                .metadata
+                .get("msg_type")
+                .and_then(|v| v.as_str())
+                == Some("callback_query")
+        {
+            let original_id = msg
+                .metadata
+                .get("original_message_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_default();
+            format!(
+                "[User pressed button: '{}' on message {}]",
+                msg.content, original_id
+            )
+        } else {
+            msg.content.clone()
+        };
+
+        // Inject memory context into user message
+        let context = crate::agent::build_context(mem.as_ref(), &user_content).await;
+        let enriched = if context.is_empty() {
+            format!("{channel_context}{user_content}")
+        } else {
+            format!("{channel_context}{context}{user_content}")
         };
 
         history.push(ChatMessage::user(&enriched));

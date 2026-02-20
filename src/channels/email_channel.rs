@@ -417,6 +417,7 @@ impl Channel for EmailChannel {
                             content,
                             channel: "email".to_string(),
                             timestamp: ts,
+                            metadata: std::collections::HashMap::new(),
                         };
                         if tx.send(msg).await.is_err() {
                             return Ok(());

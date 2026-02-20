@@ -724,6 +724,9 @@ pub struct CpRelayConfig {
 pub struct TelegramConfig {
     pub bot_token: String,
     pub allowed_users: Vec<String>,
+    /// External STT endpoint for voice transcription (e.g. "http://localhost:9000")
+    #[serde(default)]
+    pub stt_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1176,6 +1179,7 @@ mod tests {
                 telegram: Some(TelegramConfig {
                     bot_token: "123:ABC".into(),
                     allowed_users: vec!["user1".into()],
+                    stt_endpoint: None,
                 }),
                 discord: None,
                 slack: None,
@@ -1317,6 +1321,7 @@ default_temperature = 0.7
         let tc = TelegramConfig {
             bot_token: "123:XYZ".into(),
             allowed_users: vec!["alice".into(), "bob".into()],
+            stt_endpoint: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();

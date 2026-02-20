@@ -337,6 +337,7 @@ impl Channel for DiscordChannel {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        metadata: std::collections::HashMap::new(),
                     };
 
                     if tx.send(channel_msg).await.is_err() {

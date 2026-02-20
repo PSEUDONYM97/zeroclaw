@@ -9,6 +9,7 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod screenshot;
 pub mod shell;
+pub mod telegram_rich;
 pub mod traits;
 
 pub use browser::BrowserTool;
@@ -26,10 +27,12 @@ pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 
+use crate::channels::telegram::TelegramChannel;
+use crate::channels::telegram_types::TelegramToolContext;
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
@@ -106,6 +109,24 @@ pub fn all_tools_with_runtime(
     }
 
     tools
+}
+
+/// Create Telegram-specific tools for rich messaging.
+pub fn telegram_tools(
+    channel: Arc<TelegramChannel>,
+    context: Arc<Mutex<Option<TelegramToolContext>>>,
+) -> Vec<Box<dyn Tool>> {
+    vec![
+        Box::new(telegram_rich::TelegramKeyboardTool::new(
+            channel.clone(),
+            context.clone(),
+        )),
+        Box::new(telegram_rich::TelegramPollTool::new(
+            channel.clone(),
+            context.clone(),
+        )),
+        Box::new(telegram_rich::TelegramEditTool::new(channel, context)),
+    ]
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ pub struct ChannelMessage {
     pub content: String,
     pub channel: String,
     pub timestamp: u64,
+    pub metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[async_trait]
@@ -96,6 +97,7 @@ impl Channel for TelegramChannel {
                             content: msg["text"].as_str().unwrap_or("").to_string(),
                             channel: "telegram".into(),
                             timestamp: msg["date"].as_u64().unwrap_or(0),
+                            metadata: std::collections::HashMap::new(),
                         };
 
                         if tx.send(channel_msg).await.is_err() {
