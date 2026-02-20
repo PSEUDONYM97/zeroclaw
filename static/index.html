@@ -611,7 +611,7 @@ function makeInstanceCard(inst, isArchived) {
     h('div', { className: 'card-meta' },
       h('span', { textContent: 'Port: ' + (inst.port || '-') }),
       inst.pid ? h('span', { textContent: 'PID: ' + inst.pid }) : null,
-      isArchived ? h('span', { textContent: 'Archived: ' + inst.archived_at, style: 'color:var(--text-dim)' }) : null
+      isArchived ? h('span', { textContent: 'Archived: ' + fmtTime(inst.archived_at), style: 'color:var(--text-dim)' }) : null
     )
   );
   return card;
@@ -777,6 +777,8 @@ async function doArchiveInstance(name) {
         }
       } catch (e) {
         if (e.name === 'AbortError') return;
+        var content = document.getElementById('tab-content');
+        if (content) showNotify(content, 'error', 'Archive failed: ' + e.message);
       }
     }
   );
@@ -793,6 +795,8 @@ async function doUnarchiveInstance(name) {
     }
   } catch (e) {
     if (e.name === 'AbortError') return;
+    var content = document.getElementById('tab-content');
+    if (content) showNotify(content, 'error', 'Unarchive failed: ' + e.message);
   }
 }
 
@@ -817,6 +821,8 @@ async function doDeleteInstance(name) {
         }
       } catch (e) {
         if (e.name === 'AbortError') return;
+        var content = document.getElementById('tab-content');
+        if (content) showNotify(content, 'error', 'Delete failed: ' + e.message);
       }
     }
   );
@@ -1013,6 +1019,8 @@ function makeActionBtn(label, cls, path, method) {
       if (e.name === 'AbortError') return;
       btn.textContent = label;
       btn.disabled = false;
+      var content = document.getElementById('tab-content');
+      if (content) showNotify(content, 'error', label + ' failed: ' + e.message);
     }
   });
   return btn;

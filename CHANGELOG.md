@@ -7,20 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Phase 13.1 -- Agent CRUD API**: HTTP endpoints to create (`POST /api/instances`),
+  archive, unarchive, clone, and hard-delete agent instances. Includes name validation,
+  auto port allocation (18801-18999), unique active-port index, atomic config writes,
+  two-step delete safety (must archive before delete), and message preservation on delete.
+  20 gate tests in `tests/phase13_gates.rs`.
+- **Phase 13.5 -- CRUD UI**: Full CRUD actions in the embedded SPA. Dashboard toolbar
+  with "New Instance" button and "Show Archived" toggle. Create/clone modal dialogs,
+  archive/delete confirmation dialogs, clean error handling for 400/404/409 responses.
+  Archived instance detail views with status banner and appropriate action buttons.
+  `?include_archived=true` query param on instance list. 5 UI-flow gate tests.
+- `Registry::list_instances_filtered(include_archived)` -- list instances with optional
+  archived inclusion, sorted active-first
+- `GET /instances/:name` and `/details` now fall back to archived instance lookup
+
 ### Security
-- **Legacy XOR cipher migration**: The `enc:` prefix (XOR cipher) is now deprecated. 
+- **Legacy XOR cipher migration**: The `enc:` prefix (XOR cipher) is now deprecated.
   Secrets using this format will be automatically migrated to `enc2:` (ChaCha20-Poly1305 AEAD)
   when decrypted via `decrypt_and_migrate()`. A `tracing::warn!` is emitted when legacy
   values are encountered. The XOR cipher will be removed in a future release.
 
 ### Added
-- `SecretStore::decrypt_and_migrate()` — Decrypts secrets and returns a migrated `enc2:` 
+- `SecretStore::decrypt_and_migrate()` -- Decrypts secrets and returns a migrated `enc2:`
   value if the input used the legacy `enc:` format
-- `SecretStore::needs_migration()` — Check if a value uses the legacy `enc:` format
-- `SecretStore::is_secure_encrypted()` — Check if a value uses the secure `enc2:` format
+- `SecretStore::needs_migration()` -- Check if a value uses the legacy `enc:` format
+- `SecretStore::is_secure_encrypted()` -- Check if a value uses the secure `enc2:` format
 
 ### Deprecated
-- `enc:` prefix for encrypted secrets — Use `enc2:` (ChaCha20-Poly1305) instead.
+- `enc:` prefix for encrypted secrets -- Use `enc2:` (ChaCha20-Poly1305) instead.
   Legacy values are still decrypted for backward compatibility but should be migrated.
 
 ## [0.1.0] - 2026-02-13
