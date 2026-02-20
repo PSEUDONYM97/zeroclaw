@@ -289,6 +289,7 @@ fn instance_to_json(
         "pid": live_pid,
         "config_path": inst.config_path,
         "workspace_dir": inst.workspace_dir,
+        "archived_at": inst.archived_at,
     })
 }
 
@@ -328,17 +329,32 @@ async fn handle_health(State(state): State<CpState>) -> impl IntoResponse {
     }
 }
 
-async fn handle_list_instances(State(state): State<CpState>) -> impl IntoResponse {
+#[derive(Deserialize)]
+struct ListInstancesQuery {
+    include_archived: Option<bool>,
+}
+
+async fn handle_list_instances(
+    State(state): State<CpState>,
+    Query(query): Query<ListInstancesQuery>,
+) -> impl IntoResponse {
     let db_path = state.db_path.clone();
+    let include_archived = query.include_archived.unwrap_or(false);
     let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, String> {
         let registry = Registry::open(&db_path).map_err(|e| format!("{e:#}"))?;
-        let instances = registry.list_instances().map_err(|e| format!("{e:#}"))?;
+        let instances = registry
+            .list_instances_filtered(include_archived)
+            .map_err(|e| format!("{e:#}"))?;
 
         let mut list = Vec::new();
         for inst in &instances {
-            let inst_dir = lifecycle::instance_dir_from(inst);
-            let (status, pid) =
-                lifecycle::live_status(&inst_dir).unwrap_or(("unknown".to_string(), None));
+            // Skip live_status for archived instances (they're always stopped)
+            let (status, pid) = if inst.archived_at.is_some() {
+                ("archived".to_string(), None)
+            } else {
+                let inst_dir = lifecycle::instance_dir_from(inst);
+                lifecycle::live_status(&inst_dir).unwrap_or(("unknown".to_string(), None))
+            };
             list.push(instance_to_json(inst, &status, pid));
         }
 
@@ -363,19 +379,28 @@ async fn handle_get_instance(
     let db_path = state.db_path.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<ApiResponse, String> {
         let registry = Registry::open(&db_path).map_err(|e| format!("{e:#}"))?;
-        match registry.get_instance_by_name(&name) {
-            Ok(Some(inst)) => {
-                let inst_dir = lifecycle::instance_dir_from(&inst);
-                let (status, pid) =
-                    lifecycle::live_status(&inst_dir).unwrap_or(("unknown".to_string(), None));
-                Ok(ok_json(instance_to_json(&inst, &status, pid)))
-            }
-            Ok(None) => Ok(err_json(
-                StatusCode::NOT_FOUND,
-                &format!("No instance named '{name}'"),
-            )),
-            Err(e) => Err(format!("{e:#}")),
-        }
+        // Try active first, fall back to archived
+        let inst = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => match registry.find_archived_instance_by_name(&name) {
+                Ok(Some(inst)) => inst,
+                Ok(None) => {
+                    return Ok(err_json(
+                        StatusCode::NOT_FOUND,
+                        &format!("No instance named '{name}'"),
+                    ))
+                }
+                Err(e) => return Err(format!("{e:#}")),
+            },
+            Err(e) => return Err(format!("{e:#}")),
+        };
+        let (status, pid) = if inst.archived_at.is_some() {
+            ("archived".to_string(), None)
+        } else {
+            let inst_dir = lifecycle::instance_dir_from(&inst);
+            lifecycle::live_status(&inst_dir).unwrap_or(("unknown".to_string(), None))
+        };
+        Ok(ok_json(instance_to_json(&inst, &status, pid)))
     })
     .await;
 
@@ -1252,14 +1277,25 @@ async fn handle_details(
             Err(resp) => return resp,
         };
 
+        // Try active first, fall back to archived for detail views
         let instance = match registry.get_instance_by_name(&name) {
             Ok(Some(inst)) => inst,
-            Ok(None) => {
-                return err_json(
-                    StatusCode::NOT_FOUND,
-                    &format!("No instance named '{name}'"),
-                )
-            }
+            Ok(None) => match registry.find_archived_instance_by_name(&name) {
+                Ok(Some(inst)) => inst,
+                Ok(None) => {
+                    return err_json(
+                        StatusCode::NOT_FOUND,
+                        &format!("No instance named '{name}'"),
+                    )
+                }
+                Err(e) => {
+                    tracing::error!("Failed to query archived instance: {e:#}");
+                    return err_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to query instance",
+                    );
+                }
+            },
             Err(e) => {
                 tracing::error!("Failed to query instance: {e:#}");
                 return err_json(
@@ -1269,9 +1305,13 @@ async fn handle_details(
             }
         };
 
+        let is_archived = instance.archived_at.is_some();
         let inst_dir = lifecycle::instance_dir_from(&instance);
-        let (live_status, live_pid) =
-            lifecycle::live_status(&inst_dir).unwrap_or(("unknown".to_string(), None));
+        let (live_status, live_pid) = if is_archived {
+            ("archived".to_string(), None)
+        } else {
+            lifecycle::live_status(&inst_dir).unwrap_or(("unknown".to_string(), None))
+        };
 
         // Load and parse config
         let config_path = Path::new(&instance.config_path);
@@ -1415,6 +1455,7 @@ async fn handle_details(
                 "port": instance.port,
                 "status": live_status,
                 "pid": live_pid,
+                "archived_at": instance.archived_at,
             },
             "config": config_json,
             "config_error": config_error,
