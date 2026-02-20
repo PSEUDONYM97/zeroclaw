@@ -116,8 +116,11 @@ async fn handle_api_fallback() -> ApiResponse {
 pub fn build_router(state: CpState) -> Router {
     let api_router = Router::new()
         .route("/health", get(handle_health))
-        .route("/instances", get(handle_list_instances))
-        .route("/instances/:name", get(handle_get_instance))
+        .route("/instances", get(handle_list_instances).post(handle_create_instance))
+        .route("/instances/:name", get(handle_get_instance).delete(handle_delete_instance))
+        .route("/instances/:name/archive", post(handle_archive))
+        .route("/instances/:name/unarchive", post(handle_unarchive))
+        .route("/instances/:name/clone", post(handle_clone_instance))
         .route("/instances/:name/start", post(handle_start))
         .route("/instances/:name/stop", post(handle_stop))
         .route("/instances/:name/restart", post(handle_restart))
@@ -185,6 +188,90 @@ fn open_registry(db_path: &Path) -> Result<Registry, ApiResponse> {
         tracing::error!("Failed to open registry: {e:#}");
         err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open registry")
     })
+}
+
+// ── Phase 13.1: CRUD request bodies ─────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateInstanceBody {
+    name: String,
+    port: Option<u16>,
+    model_provider: Option<String>,
+    model_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CloneInstanceBody {
+    new_name: String,
+    port: Option<u16>,
+}
+
+// ── Phase 13.1: helpers ─────────────────────────────────────────
+
+/// Validate instance name: alphanumeric + hyphens, 1-64 chars, starts with alphanum.
+fn validate_instance_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 64 {
+        return Err("Name must be 1-64 characters".into());
+    }
+    if !name.chars().next().unwrap().is_ascii_alphanumeric() {
+        return Err("Name must start with a letter or digit".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err("Name may only contain letters, digits, and hyphens".into());
+    }
+    Ok(())
+}
+
+/// Derive instances_dir from db_path (sibling directory).
+fn instances_dir_from_db(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("instances")
+}
+
+/// Atomic config write with fsync (replicates openclaw.rs:773-805 pattern).
+fn write_config_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no parent dir"))?;
+    let temp = dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(content)?;
+    f.sync_all()?;
+    std::fs::rename(&temp, path)?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Build a Config struct with sane defaults, applying overrides.
+fn build_default_config(
+    port: u16,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config.gateway.port = port;
+    config.gateway.host = "127.0.0.1".to_string();
+    if let Some(p) = provider {
+        config.default_provider = Some(p.to_string());
+    }
+    if let Some(m) = model {
+        config.default_model = Some(m.to_string());
+    }
+    config
 }
 
 // ── Instance serialization ───────────────────────────────────────
@@ -378,6 +465,545 @@ async fn handle_restart(
             &format!("Task join error: {e}"),
         ),
     }
+}
+
+// ── Phase 13.1: CRUD handlers ───────────────────────────────────
+
+async fn handle_create_instance(
+    State(state): State<CpState>,
+    Json(body): Json<CreateInstanceBody>,
+) -> impl IntoResponse {
+    if let Err(msg) = validate_instance_name(&body.name) {
+        return err_json(StatusCode::BAD_REQUEST, &msg);
+    }
+
+    let db_path = state.db_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        // Check for name conflict
+        match registry.get_instance_by_name(&body.name) {
+            Ok(Some(_)) => {
+                return err_json(
+                    StatusCode::CONFLICT,
+                    &format!("Instance '{}' already exists", body.name),
+                )
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        }
+
+        // Allocate port
+        let port = if let Some(p) = body.port {
+            p
+        } else {
+            match registry.allocate_port_with_excludes(18801, 18999, &[]) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    return err_json(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "No ports available in range 18801-18999",
+                    )
+                }
+                Err(e) => {
+                    tracing::error!("Port allocation failed: {e:#}");
+                    return err_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to allocate port",
+                    );
+                }
+            }
+        };
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let instances_dir = instances_dir_from_db(&db_path);
+        let inst_dir = instances_dir.join(&id);
+
+        // Create instance directory + workspace subdirs
+        let workspace_dir = inst_dir.join("workspace");
+        for subdir in &["skills", "memory", "sessions", "state", "cron"] {
+            if let Err(e) = std::fs::create_dir_all(workspace_dir.join(subdir)) {
+                tracing::error!("Failed to create workspace dir: {e}");
+                let _ = std::fs::remove_dir_all(&inst_dir);
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to create workspace directories",
+                );
+            }
+        }
+
+        // Build and write config
+        let mut config = build_default_config(
+            port,
+            body.model_provider.as_deref(),
+            body.model_name.as_deref(),
+        );
+        let config_path = inst_dir.join("config.toml");
+        config.config_path = config_path.clone();
+        config.workspace_dir = workspace_dir.clone();
+
+        let toml_str = match toml::to_string_pretty(&config) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&inst_dir);
+                tracing::error!("Failed to serialize config: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to serialize config",
+                );
+            }
+        };
+
+        if let Err(e) = write_config_atomic(&config_path, toml_str.as_bytes()) {
+            let _ = std::fs::remove_dir_all(&inst_dir);
+            tracing::error!("Failed to write config: {e}");
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to write config file",
+            );
+        }
+
+        // Register in DB
+        match registry.create_instance(
+            &id,
+            &body.name,
+            port,
+            config_path.to_str().unwrap_or(""),
+            Some(workspace_dir.to_str().unwrap_or("")),
+            None,
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&inst_dir);
+                let msg = format!("{e:#}");
+                if msg.contains("UNIQUE constraint failed") {
+                    return err_json(
+                        StatusCode::CONFLICT,
+                        &format!("Port {} is already in use by another instance", port),
+                    );
+                }
+                tracing::error!("Failed to register instance: {msg}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to register instance",
+                );
+            }
+        }
+
+        (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "id": id,
+                "name": body.name,
+                "port": port,
+                "status": "stopped",
+            })),
+        )
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+async fn handle_archive(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let db_path = state.db_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No active instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        // Check live truth and stop if running
+        let inst_dir = lifecycle::instance_dir_from(&instance);
+        let (live_status, _) =
+            lifecycle::live_status(&inst_dir).unwrap_or(("unknown".to_string(), None));
+
+        if live_status == "running" {
+            if let Err(e) = lifecycle::stop_instance(&registry, &name) {
+                return lifecycle_err_to_response(e);
+            }
+        }
+
+        // Archive
+        match registry.archive_instance(&instance.id) {
+            Ok(true) => ok_json(serde_json::json!({ "status": "archived", "name": name })),
+            Ok(false) => err_json(StatusCode::NOT_FOUND, &format!("Instance '{name}' not found")),
+            Err(e) => {
+                tracing::error!("Failed to archive instance: {e:#}");
+                err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to archive instance",
+                )
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+async fn handle_unarchive(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let db_path = state.db_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        // Check no active instance with this name
+        match registry.get_instance_by_name(&name) {
+            Ok(Some(_)) => {
+                return err_json(
+                    StatusCode::CONFLICT,
+                    &format!("Active instance named '{name}' already exists"),
+                )
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        }
+
+        match registry.unarchive_instance(&name) {
+            Ok(true) => ok_json(serde_json::json!({ "status": "active", "name": name })),
+            Ok(false) => err_json(
+                StatusCode::NOT_FOUND,
+                &format!("No archived instance named '{name}'"),
+            ),
+            Err(e) => {
+                tracing::error!("Failed to unarchive instance: {e:#}");
+                err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to unarchive instance",
+                )
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+async fn handle_clone_instance(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<CloneInstanceBody>,
+) -> impl IntoResponse {
+    if let Err(msg) = validate_instance_name(&body.new_name) {
+        return err_json(StatusCode::BAD_REQUEST, &msg);
+    }
+
+    let db_path = state.db_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        // Get source instance
+        let source = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        // Check new name doesn't conflict
+        match registry.get_instance_by_name(&body.new_name) {
+            Ok(Some(_)) => {
+                return err_json(
+                    StatusCode::CONFLICT,
+                    &format!("Instance '{}' already exists", body.new_name),
+                )
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        }
+
+        // Allocate port
+        let port = if let Some(p) = body.port {
+            p
+        } else {
+            match registry.allocate_port_with_excludes(18801, 18999, &[]) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    return err_json(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "No ports available in range 18801-18999",
+                    )
+                }
+                Err(e) => {
+                    tracing::error!("Port allocation failed: {e:#}");
+                    return err_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to allocate port",
+                    );
+                }
+            }
+        };
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let instances_dir = instances_dir_from_db(&db_path);
+        let new_inst_dir = instances_dir.join(&new_id);
+
+        // Read and parse source config
+        let source_config_str = match std::fs::read_to_string(&source.config_path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to read source config: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to read source config",
+                );
+            }
+        };
+
+        let mut config: crate::config::Config = match toml::from_str(&source_config_str) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Failed to parse source config: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to parse source config",
+                );
+            }
+        };
+
+        // Mutate clone
+        config.gateway.port = port;
+        config.gateway.paired_tokens = vec![]; // clear auth state
+
+        let new_config_path = new_inst_dir.join("config.toml");
+        config.config_path = new_config_path.clone();
+        let new_workspace = new_inst_dir.join("workspace");
+        config.workspace_dir = new_workspace.clone();
+
+        // Create workspace subdirs
+        for subdir in &["skills", "memory", "sessions", "state", "cron"] {
+            if let Err(e) = std::fs::create_dir_all(new_workspace.join(subdir)) {
+                tracing::error!("Failed to create workspace dir: {e}");
+                let _ = std::fs::remove_dir_all(&new_inst_dir);
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to create workspace directories",
+                );
+            }
+        }
+
+        // Copy skills from source if they exist
+        if let Some(ref src_ws) = source.workspace_dir {
+            let src_skills = PathBuf::from(src_ws).join("skills");
+            let dst_skills = new_workspace.join("skills");
+            if src_skills.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&src_skills) {
+                    for entry in entries.flatten() {
+                        let src_path = entry.path();
+                        let dst_path = dst_skills.join(entry.file_name());
+                        if src_path.is_dir() {
+                            let _ = copy_dir_recursive(&src_path, &dst_path);
+                        } else {
+                            let _ = std::fs::copy(&src_path, &dst_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Write config
+        let toml_str = match toml::to_string_pretty(&config) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&new_inst_dir);
+                tracing::error!("Failed to serialize config: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to serialize config",
+                );
+            }
+        };
+
+        if let Err(e) = write_config_atomic(&new_config_path, toml_str.as_bytes()) {
+            let _ = std::fs::remove_dir_all(&new_inst_dir);
+            tracing::error!("Failed to write config: {e}");
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to write config file",
+            );
+        }
+
+        // Register in DB
+        match registry.create_instance(
+            &new_id,
+            &body.new_name,
+            port,
+            new_config_path.to_str().unwrap_or(""),
+            Some(new_workspace.to_str().unwrap_or("")),
+            None,
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&new_inst_dir);
+                let msg = format!("{e:#}");
+                if msg.contains("UNIQUE constraint failed") {
+                    return err_json(
+                        StatusCode::CONFLICT,
+                        &format!("Port {} is already in use by another instance", port),
+                    );
+                }
+                tracing::error!("Failed to register cloned instance: {msg}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to register instance",
+                );
+            }
+        }
+
+        (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "id": new_id,
+                "name": body.new_name,
+                "port": port,
+                "cloned_from": name,
+                "status": "stopped",
+            })),
+        )
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+async fn handle_delete_instance(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let db_path = state.db_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        match registry.delete_archived_instance(&name) {
+            Ok(Some(inst)) => {
+                // Remove filesystem artifacts
+                let inst_dir = lifecycle::instance_dir_from(&inst);
+                if inst_dir.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&inst_dir) {
+                        tracing::warn!("Failed to remove instance dir {}: {e}", inst_dir.display());
+                    }
+                }
+                ok_json(serde_json::json!({ "status": "deleted", "name": name }))
+            }
+            Ok(None) => {
+                // Not archived -- check if it's active
+                match registry.get_instance_by_name(&name) {
+                    Ok(Some(_)) => err_json(
+                        StatusCode::CONFLICT,
+                        "Instance must be archived before deletion",
+                    ),
+                    _ => err_json(
+                        StatusCode::NOT_FOUND,
+                        &format!("No instance named '{name}'"),
+                    ),
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to delete instance: {e:#}");
+                err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to delete instance",
+                )
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+/// Recursively copy a directory.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 // ── Logs (enhanced with pagination modes) ────────────────────────
