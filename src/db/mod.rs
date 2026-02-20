@@ -208,6 +208,27 @@ impl Registry {
              ON instances(name) WHERE archived_at IS NULL;",
         )?;
 
+        // Phase 13.1: unique active-port index (prevents duplicate active ports)
+        let port_dupes: Vec<(i64, i64)> = conn
+            .prepare("SELECT port, COUNT(*) as cnt FROM instances WHERE archived_at IS NULL GROUP BY port HAVING cnt > 1")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !port_dupes.is_empty() {
+            let ports: Vec<i64> = port_dupes.iter().map(|(p, _)| *p).collect();
+            anyhow::bail!(
+                "Cannot create unique active-port index: duplicate active instance ports found: {:?}. \
+                 Resolve manually by archiving duplicates or changing ports, then restart.",
+                ports
+            );
+        }
+
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_instances_active_port
+             ON instances(port) WHERE archived_at IS NULL;",
+        )?;
+
         // Phase 7.5: agent_events table
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS agent_events (
@@ -411,6 +432,68 @@ impl Registry {
             )
             .context("Failed to delete migration instance")?;
         Ok(rows > 0)
+    }
+
+    // ── Instance CRUD (Phase 13.1) ──────────────────────────────
+
+    /// Archive (soft-delete) an instance by ID. Sets archived_at, clears status/pid.
+    pub fn archive_instance(&self, id: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE instances SET archived_at = datetime('now'), status = 'stopped', pid = NULL
+             WHERE id = ?1 AND archived_at IS NULL",
+            params![id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Unarchive a previously archived instance by name.
+    /// Caller must check active name/port uniqueness first.
+    pub fn unarchive_instance(&self, name: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE instances SET archived_at = NULL WHERE name = ?1 AND archived_at IS NOT NULL",
+            params![name],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Hard-delete an archived instance row and mutable related data.
+    /// Messages/message_events are PRESERVED (Phase 10.2 append-only contract).
+    /// Only works on archived instances. Returns the Instance if deleted.
+    pub fn delete_archived_instance(&self, name: &str) -> Result<Option<Instance>> {
+        let inst = self.find_archived_instance_by_name(name)?;
+        if let Some(ref inst) = inst {
+            self.conn.execute_batch("BEGIN")?;
+            let result = (|| -> Result<()> {
+                // Delete mutable related data (NOT messages/message_events -- append-only)
+                self.conn.execute(
+                    "DELETE FROM agent_events WHERE instance_id = ?1",
+                    params![inst.id],
+                )?;
+                self.conn.execute(
+                    "DELETE FROM agent_usage WHERE instance_id = ?1",
+                    params![inst.id],
+                )?;
+                // Delete routing rules referencing this instance
+                self.conn.execute(
+                    "DELETE FROM routing_rules WHERE from_instance = ?1 OR to_instance = ?1",
+                    params![inst.name],
+                )?;
+                // Delete the instance row itself
+                self.conn.execute(
+                    "DELETE FROM instances WHERE id = ?1 AND archived_at IS NOT NULL",
+                    params![inst.id],
+                )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => self.conn.execute_batch("COMMIT")?,
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            }
+        }
+        Ok(inst)
     }
 
     /// Allocate the next available port in [start, end], skipping ports already
