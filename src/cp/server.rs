@@ -152,6 +152,23 @@ pub fn build_router(state: CpState) -> Router {
             "/messages/:id/acknowledge",
             post(messaging::handle_acknowledge_message),
         )
+        // Phase 16: Flow admin endpoints
+        .route(
+            "/instances/:name/flows/active",
+            get(handle_flows_active),
+        )
+        .route(
+            "/instances/:name/flows/history",
+            get(handle_flows_history),
+        )
+        .route(
+            "/instances/:name/flows/active/:chat_id",
+            delete(handle_flow_force_complete),
+        )
+        .route(
+            "/instances/:name/flows/active/:chat_id/replay",
+            post(handle_flow_replay),
+        )
         // Phase 15.5: Telegram observability endpoints
         .route(
             "/instances/:name/telegram/events",
@@ -2480,6 +2497,374 @@ async fn handle_telegram_health(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Failed to compute health counters",
                 )
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── Phase 16: Flow Admin API ────────────────────────────────────
+
+/// Helper: resolve workspace_dir -> state.db path for an instance.
+fn resolve_state_db(instance: &crate::db::Instance) -> Result<PathBuf, ApiResponse> {
+    let ws = instance.workspace_dir.as_deref().ok_or_else(|| {
+        err_json(
+            StatusCode::BAD_REQUEST,
+            "Instance has no workspace_dir configured",
+        )
+    })?;
+    Ok(PathBuf::from(ws).join("state.db"))
+}
+
+/// GET /api/instances/:name/flows/active
+async fn handle_flows_active(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        let state_db_path = match resolve_state_db(&instance) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        if !state_db_path.exists() {
+            return ok_json(serde_json::json!({ "flows": [], "total": 0 }));
+        }
+
+        let flow_db = match crate::flows::db::FlowDb::open_read_only(&state_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("Failed to open state.db: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open flow state DB");
+            }
+        };
+
+        match flow_db.list_active() {
+            Ok(rows) => {
+                let flows: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "chat_id": r.chat_id,
+                            "flow_name": r.flow_name,
+                            "current_step": r.current_step,
+                            "started_at": r.started_at,
+                            "step_entered_at": r.step_entered_at,
+                            "anchor_message_id": r.anchor_message_id,
+                            "status": r.status,
+                        })
+                    })
+                    .collect();
+                let total = flows.len();
+                ok_json(serde_json::json!({ "flows": flows, "total": total }))
+            }
+            Err(e) => {
+                tracing::error!("Failed to list active flows: {e:#}");
+                err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to list active flows")
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct FlowHistoryQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    flow_name: Option<String>,
+    status: Option<String>,
+    chat_id: Option<String>,
+}
+
+/// GET /api/instances/:name/flows/history
+async fn handle_flows_history(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+    Query(params): Query<FlowHistoryQuery>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+    let limit = params.limit.unwrap_or(50).min(200);
+    let offset = params.offset.unwrap_or(0);
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        let state_db_path = match resolve_state_db(&instance) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        if !state_db_path.exists() {
+            return ok_json(serde_json::json!({
+                "history": [],
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+            }));
+        }
+
+        let flow_db = match crate::flows::db::FlowDb::open_read_only(&state_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("Failed to open state.db: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open flow state DB");
+            }
+        };
+
+        match flow_db.list_history(
+            limit,
+            offset,
+            params.flow_name.as_deref(),
+            params.status.as_deref(),
+            params.chat_id.as_deref(),
+        ) {
+            Ok((rows, total)) => {
+                let history: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "chat_id": r.chat_id,
+                            "flow_name": r.flow_name,
+                            "final_step": r.final_step,
+                            "started_at": r.started_at,
+                            "completed_at": r.completed_at,
+                            "status": r.status,
+                            "anchor_message_id": r.anchor_message_id,
+                        })
+                    })
+                    .collect();
+                ok_json(serde_json::json!({
+                    "history": history,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                }))
+            }
+            Err(e) => {
+                tracing::error!("Failed to list flow history: {e:#}");
+                err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to list flow history")
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+/// DELETE /api/instances/:name/flows/active/:chat_id
+async fn handle_flow_force_complete(
+    State(state): State<CpState>,
+    AxumPath((name, chat_id)): AxumPath<(String, String)>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        let state_db_path = match resolve_state_db(&instance) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        if !state_db_path.exists() {
+            return err_json(StatusCode::NOT_FOUND, "No flow state DB found");
+        }
+
+        let flow_db = match crate::flows::db::FlowDb::open(&state_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("Failed to open state.db: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open flow state DB");
+            }
+        };
+
+        match flow_db.complete_flow(&chat_id, "force_completed") {
+            Ok(Some(row)) => ok_json(serde_json::json!({
+                "status": "force_completed",
+                "chat_id": row.chat_id,
+                "flow_name": row.flow_name,
+                "final_step": row.current_step,
+            })),
+            Ok(None) => err_json(
+                StatusCode::NOT_FOUND,
+                &format!("No active flow for chat_id '{chat_id}'"),
+            ),
+            Err(e) => {
+                tracing::error!("Failed to force-complete flow: {e:#}");
+                err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to force-complete flow")
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct FlowReplayBody {
+    step: String,
+}
+
+/// POST /api/instances/:name/flows/active/:chat_id/replay
+async fn handle_flow_replay(
+    State(state): State<CpState>,
+    AxumPath((name, chat_id)): AxumPath<(String, String)>,
+    Json(body): Json<FlowReplayBody>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        let state_db_path = match resolve_state_db(&instance) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        if !state_db_path.exists() {
+            return err_json(StatusCode::NOT_FOUND, "No flow state DB found");
+        }
+
+        let flow_db = match crate::flows::db::FlowDb::open(&state_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("Failed to open state.db: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open flow state DB");
+            }
+        };
+
+        // Check that the flow exists
+        let active = match flow_db.get_active(&chat_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No active flow for chat_id '{chat_id}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query active flow: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query active flow");
+            }
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        match flow_db.update_step(&chat_id, &body.step, active.anchor_message_id, &now) {
+            Ok(true) => ok_json(serde_json::json!({
+                "status": "replayed",
+                "chat_id": chat_id,
+                "flow_name": active.flow_name,
+                "previous_step": active.current_step,
+                "new_step": body.step,
+            })),
+            Ok(false) => err_json(
+                StatusCode::NOT_FOUND,
+                &format!("No active flow for chat_id '{chat_id}'"),
+            ),
+            Err(e) => {
+                tracing::error!("Failed to replay flow: {e:#}");
+                err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to replay flow")
             }
         }
     })

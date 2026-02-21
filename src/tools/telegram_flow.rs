@@ -134,14 +134,24 @@ impl Tool for TelegramFlowTool {
 
         // Execute the start step
         match execute_step(&self.channel, &chat_id, start_step, None).await {
-            Ok(anchor_msg_id) => {
+            Ok(result) => {
                 // Register the flow in the store
                 self.flow_store.start_flow(
                     &chat_id,
                     &flow_name,
                     &flow_def.start_step,
-                    anchor_msg_id,
+                    result.anchor_message_id,
                 );
+
+                // Store poll_id mapping if present
+                if let Some(ref poll_id) = result.poll_id {
+                    if let Some(ref db) = self.flow_store.db() {
+                        let key = format!("poll:{poll_id}");
+                        if let Err(e) = db.set_kv(&key, &chat_id) {
+                            tracing::warn!("Failed to store poll_id mapping: {e}");
+                        }
+                    }
+                }
 
                 Ok(ToolResult {
                     success: true,
@@ -149,7 +159,7 @@ impl Tool for TelegramFlowTool {
                         "Flow '{}' started at step '{}', message_id={}",
                         flow_name,
                         flow_def.start_step,
-                        anchor_msg_id.unwrap_or(-1),
+                        result.anchor_message_id.unwrap_or(-1),
                     ),
                     error: None,
                 })

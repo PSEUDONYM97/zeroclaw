@@ -62,6 +62,7 @@ pub struct TelegramChannel {
     stt_semaphore: Arc<tokio::sync::Semaphore>,
     observer: Option<Arc<dyn Observer>>,
     seen_update_ids: Arc<Mutex<SeenUpdates>>,
+    flow_db: Option<Arc<crate::flows::db::FlowDb>>,
 }
 
 impl TelegramChannel {
@@ -74,12 +75,19 @@ impl TelegramChannel {
             stt_semaphore: Arc::new(tokio::sync::Semaphore::new(STT_CONCURRENCY)),
             observer: None,
             seen_update_ids: Arc::new(Mutex::new(SeenUpdates::new())),
+            flow_db: None,
         }
     }
 
     /// Attach an STT endpoint for voice transcription
     pub fn with_stt(mut self, stt_endpoint: String) -> Self {
         self.speech = Some(Arc::new(SpeechClient::new(stt_endpoint)));
+        self
+    }
+
+    /// Attach a FlowDb for offset persistence and poll_id mapping.
+    pub fn with_flow_db(mut self, db: Arc<crate::flows::db::FlowDb>) -> Self {
+        self.flow_db = Some(db);
         self
     }
 
@@ -659,6 +667,43 @@ impl TelegramChannel {
         Ok(msg_id)
     }
 
+    /// Send a poll and return both message_id and poll_id.
+    pub async fn send_poll_with_id(
+        &self,
+        chat_id: &str,
+        question: &str,
+        options: &[String],
+        is_anonymous: bool,
+    ) -> anyhow::Result<(i64, Option<String>)> {
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "question": question,
+            "options": options,
+            "is_anonymous": is_anonymous,
+        });
+
+        let resp = self
+            .client
+            .post(self.api_url("sendPoll"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            anyhow::bail!("Telegram sendPoll failed: {err}");
+        }
+
+        let data: serde_json::Value = resp.json().await?;
+        let msg_id = data["result"]["message_id"]
+            .as_i64()
+            .unwrap_or_default();
+        let poll_id = data["result"]["poll"]["id"]
+            .as_str()
+            .map(|s| s.to_string());
+        Ok((msg_id, poll_id))
+    }
+
     /// Build the JSON body for `send_poll` (for testing).
     pub fn build_poll_json(
         chat_id: &str,
@@ -804,16 +849,22 @@ impl Channel for TelegramChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        let mut offset: i64 = 0;
+        // Load persisted offset (at-least-once semantics)
+        let mut offset: i64 = self
+            .flow_db
+            .as_ref()
+            .and_then(|db| db.get_kv("telegram_offset").ok().flatten())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
 
-        tracing::info!("Telegram channel listening for messages...");
+        tracing::info!("Telegram channel listening for messages (offset={offset})...");
 
         loop {
             let url = self.api_url("getUpdates");
             let body = serde_json::json!({
                 "offset": offset,
                 "timeout": 30,
-                "allowed_updates": ["message", "callback_query"]
+                "allowed_updates": ["message", "callback_query", "poll_answer"]
             });
 
             let resp = match self.client.post(&url).json(&body).send().await {
@@ -928,6 +979,91 @@ impl Channel for TelegramChannel {
 
                         if tx.send(msg).await.is_err() {
                             return Ok(());
+                        }
+                        continue;
+                    }
+
+                    // ── Handle poll_answer ─────────────────────────────
+                    if let Some(poll_answer) = update.get("poll_answer") {
+                        let poll_id = poll_answer["poll_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        let option_ids = poll_answer["option_ids"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
+
+                        // Auth check
+                        let pa_from = &poll_answer["user"];
+                        let pa_user_id = pa_from["id"].as_i64().map(|id| id.to_string());
+                        let pa_username = pa_from["username"].as_str().unwrap_or("unknown");
+                        let mut pa_identities = vec![pa_username];
+                        if let Some(ref id) = pa_user_id {
+                            pa_identities.push(id.as_str());
+                        }
+                        if !self.is_any_user_allowed(pa_identities.iter().copied()) {
+                            continue;
+                        }
+
+                        // Resolve chat_id via poll_id -> chat_id mapping
+                        let resolved_chat_id = self
+                            .flow_db
+                            .as_ref()
+                            .and_then(|db| {
+                                let key = format!("poll:{poll_id}");
+                                db.get_kv(&key).ok().flatten()
+                            });
+
+                        if let Some(chat_id) = resolved_chat_id {
+                            // Build synthetic callback for the first selected option
+                            let option_idx = option_ids
+                                .first()
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            let callback_data = format!("poll_option_{option_idx}");
+
+                            self.record_tg_event(
+                                "inbound",
+                                "tg.inbound.poll_answer",
+                                "ok",
+                                &chat_id,
+                                None,
+                                Some(build_telegram_metadata(&[
+                                    ("msg_type", serde_json::json!("poll_answer")),
+                                    ("poll_id", serde_json::json!(&poll_id)),
+                                    ("option_ids", serde_json::json!(&option_ids)),
+                                    ("chat_id", serde_json::json!(&chat_id)),
+                                ])),
+                            );
+
+                            let mut metadata = HashMap::new();
+                            metadata.insert("msg_type".into(), serde_json::json!("poll_answer"));
+                            metadata.insert("poll_id".into(), serde_json::json!(&poll_id));
+                            metadata.insert(
+                                "option_ids".into(),
+                                serde_json::json!(&option_ids),
+                            );
+
+                            let msg = ChannelMessage {
+                                id: Uuid::new_v4().to_string(),
+                                sender: chat_id,
+                                content: callback_data,
+                                channel: "telegram".to_string(),
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                metadata,
+                            };
+
+                            if tx.send(msg).await.is_err() {
+                                return Ok(());
+                            }
+                        } else {
+                            tracing::debug!(
+                                "poll_answer for poll_id={poll_id}: no chat_id mapping found"
+                            );
                         }
                         continue;
                     }
@@ -1486,6 +1622,13 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
 
                     if tx.send(msg).await.is_err() {
                         return Ok(());
+                    }
+                }
+
+                // Persist offset after processing the batch (at-least-once)
+                if let Some(ref db) = self.flow_db {
+                    if let Err(e) = db.set_kv("telegram_offset", &offset.to_string()) {
+                        tracing::warn!("Failed to persist telegram offset: {e}");
                     }
                 }
             }

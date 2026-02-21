@@ -211,7 +211,7 @@ fn flow_store_advance() {
 fn flow_store_complete() {
     let store = zeroclaw::flows::state::FlowStore::new();
     store.start_flow("chat1", "test_flow", "ask", None);
-    let removed = store.complete_flow("chat1");
+    let removed = store.complete_flow("chat1", "completed");
     assert!(removed.is_some());
     assert!(!store.has_flow("chat1"));
 }

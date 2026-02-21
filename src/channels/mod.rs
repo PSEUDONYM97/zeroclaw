@@ -562,7 +562,35 @@ pub async fn start_channels(config: Config) -> Result<()> {
             Arc::new(std::collections::HashMap::new())
         };
 
-    let flow_store = Arc::new(crate::flows::state::FlowStore::new());
+    // Create FlowDb if flows are enabled
+    let flow_db: Option<Arc<crate::flows::db::FlowDb>> = if flows_enabled {
+        let db_path = config.workspace_dir.join("state.db");
+        match crate::flows::db::FlowDb::open(&db_path) {
+            Ok(db) => {
+                tracing::info!("Flow state DB opened: {}", db_path.display());
+                Some(Arc::new(db))
+            }
+            Err(e) => {
+                anyhow::bail!("Failed to open flow state DB: {e}");
+            }
+        }
+    } else {
+        None
+    };
+
+    let flow_store = Arc::new(if let Some(ref db) = flow_db {
+        let store = crate::flows::state::FlowStore::with_db(db.clone());
+        match store.load_from_db() {
+            Ok(n) if n > 0 => {
+                println!("  🔄 Flows:    {n} active flows restored from DB");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Failed to load flows from DB: {e}"),
+        }
+        store
+    } else {
+        crate::flows::state::FlowStore::new()
+    });
 
     // Conditionally register Telegram tools
     let telegram_channel_arc: Option<Arc<TelegramChannel>> =
@@ -572,6 +600,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 ch = ch.with_stt(endpoint.clone());
             }
             ch = ch.with_observer(observer.clone());
+            if let Some(ref db) = flow_db {
+                ch = ch.with_flow_db(db.clone());
+            }
             let arc = Arc::new(ch);
             if flows_enabled && !flow_defs.is_empty() {
                 tools_registry.extend(tools::telegram_tools_with_flows(
@@ -801,6 +832,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
+                // Sync cache with DB (picks up CP mutations within 5s)
+                if let Err(e) = timeout_store.refresh_from_db() {
+                    tracing::warn!("Flow store refresh failed: {e}");
+                }
                 let timed_out = timeout_store.check_timeouts(&timeout_defs);
                 for (chat_id, flow_name, step_id) in timed_out {
                     tracing::info!("Flow '{flow_name}' step '{step_id}' timed out for chat {chat_id}");
@@ -826,7 +861,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                                         {
                                             Ok(_) => {
                                                 if target_step.is_terminal() {
-                                                    timeout_store.complete_flow(&chat_id);
+                                                    timeout_store.complete_flow(&chat_id, "timed_out");
                                                 } else {
                                                     let _ = timeout_store.advance(
                                                         &chat_id,
@@ -837,14 +872,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
                                             }
                                             Err(e) => {
                                                 tracing::warn!("Timeout step execution failed: {e}");
-                                                timeout_store.complete_flow(&chat_id);
+                                                timeout_store.complete_flow(&chat_id, "timed_out");
                                             }
                                         }
                                     }
                                 }
                             } else {
                                 // No _timeout transition; just complete the flow
-                                timeout_store.complete_flow(&chat_id);
+                                timeout_store.complete_flow(&chat_id, "timed_out");
                             }
                         }
                     }
@@ -886,13 +921,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
             }
         }
 
-        // ── Flow pre-processing: callbacks may advance a flow without LLM ──
+        // ── Flow pre-processing: callbacks/poll_answers may advance a flow without LLM ──
+        let msg_type_str = msg
+            .metadata
+            .get("msg_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if msg.channel == "telegram"
-            && msg
-                .metadata
-                .get("msg_type")
-                .and_then(|v| v.as_str())
-                == Some("callback_query")
+            && (msg_type_str == "callback_query" || msg_type_str == "poll_answer")
             && flows_enabled
             && flow_store.has_flow(&msg.sender)
         {
@@ -923,9 +959,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
                                     )
                                     .await
                                     {
-                                        Ok(new_anchor) => {
+                                        Ok(result) => {
+                                            // Store poll_id mapping if present
+                                            if let Some(ref poll_id) = result.poll_id {
+                                                if let Some(ref db) = flow_db {
+                                                    let key = format!("poll:{poll_id}");
+                                                    if let Err(e) = db.set_kv(&key, &chat_id) {
+                                                        tracing::warn!("Failed to store poll_id mapping: {e}");
+                                                    }
+                                                }
+                                            }
                                             if target_step.is_terminal() {
-                                                flow_store.complete_flow(&chat_id);
+                                                flow_store.complete_flow(&chat_id, "completed");
                                                 tracing::info!(
                                                     "Flow '{flow_name}' completed at terminal step '{target_step_id}'"
                                                 );
@@ -933,7 +978,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                                                 let _ = flow_store.advance(
                                                     &chat_id,
                                                     &target_step_id,
-                                                    new_anchor,
+                                                    result.anchor_message_id,
                                                 );
                                             }
                                             // If agent_handoff, fall through to agent_turn
@@ -945,7 +990,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                                             tracing::warn!(
                                                 "Flow step execution failed: {e}; completing flow"
                                             );
-                                            flow_store.complete_flow(&chat_id);
+                                            flow_store.complete_flow(&chat_id, "completed");
                                             // Fall through to agent_turn
                                         }
                                     }

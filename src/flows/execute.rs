@@ -2,14 +2,22 @@ use super::types::{ButtonDef, Step, StepKind};
 use crate::channels::telegram::TelegramChannel;
 use crate::channels::telegram_types::InlineButton;
 
+/// Result of executing a flow step -- carries both the anchor message_id and
+/// an optional poll_id (for poll_answer routing).
+#[derive(Debug, Clone)]
+pub struct StepExecuteResult {
+    pub anchor_message_id: Option<i64>,
+    pub poll_id: Option<String>,
+}
+
 /// Execute a flow step against the Telegram API.
-/// Returns the message_id of the sent/edited message (for anchor tracking).
+/// Returns a `StepExecuteResult` with the message_id and optional poll_id.
 pub async fn execute_step(
     channel: &TelegramChannel,
     chat_id: &str,
     step: &Step,
     anchor_message_id: Option<i64>,
-) -> anyhow::Result<Option<i64>> {
+) -> anyhow::Result<StepExecuteResult> {
     match step.kind {
         StepKind::Keyboard => {
             let buttons = step
@@ -24,7 +32,10 @@ pub async fn execute_step(
             let msg_id = channel
                 .send_with_keyboard(chat_id, &step.text, &buttons)
                 .await?;
-            Ok(Some(msg_id))
+            Ok(StepExecuteResult {
+                anchor_message_id: Some(msg_id),
+                poll_id: None,
+            })
         }
         StepKind::Poll => {
             let options: Vec<String> = step
@@ -32,14 +43,15 @@ pub async fn execute_step(
                 .as_ref()
                 .cloned()
                 .unwrap_or_default();
-            let msg_id = channel
-                .send_poll(chat_id, &step.text, &options, step.poll_anonymous)
+            let (msg_id, poll_id) = channel
+                .send_poll_with_id(chat_id, &step.text, &options, step.poll_anonymous)
                 .await?;
-            Ok(Some(msg_id))
+            Ok(StepExecuteResult {
+                anchor_message_id: Some(msg_id),
+                poll_id,
+            })
         }
         StepKind::Message => {
-            // Send plain text -- use the Channel::send method by building a minimal
-            // ChannelMessage for context, or just call sendMessage directly.
             let url = channel.api_url("sendMessage");
             let body = serde_json::json!({
                 "chat_id": chat_id,
@@ -49,7 +61,10 @@ pub async fn execute_step(
             let resp = channel.http_client().post(&url).json(&body).send().await?;
             let data: serde_json::Value = resp.json().await?;
             let msg_id = data["result"]["message_id"].as_i64();
-            Ok(msg_id)
+            Ok(StepExecuteResult {
+                anchor_message_id: msg_id,
+                poll_id: None,
+            })
         }
         StepKind::Edit => {
             if let Some(anchor_id) = anchor_message_id {
@@ -61,9 +76,11 @@ pub async fn execute_step(
                 channel
                     .edit_message_text(chat_id, anchor_id, &step.text, buttons.as_deref())
                     .await?;
-                Ok(Some(anchor_id))
+                Ok(StepExecuteResult {
+                    anchor_message_id: Some(anchor_id),
+                    poll_id: None,
+                })
             } else {
-                // No anchor -- fall back to sending a new message
                 tracing::warn!("edit step '{}' has no anchor message_id, sending new message", step.id);
                 let url = channel.api_url("sendMessage");
                 let body = serde_json::json!({
@@ -74,7 +91,10 @@ pub async fn execute_step(
                 let resp = channel.http_client().post(&url).json(&body).send().await?;
                 let data: serde_json::Value = resp.json().await?;
                 let msg_id = data["result"]["message_id"].as_i64();
-                Ok(msg_id)
+                Ok(StepExecuteResult {
+                    anchor_message_id: msg_id,
+                    poll_id: None,
+                })
             }
         }
     }
@@ -100,5 +120,15 @@ mod tests {
         let inline = button_def_to_inline(&def);
         assert_eq!(inline.text, "OK");
         assert_eq!(inline.callback_data, "ok_data");
+    }
+
+    #[test]
+    fn step_execute_result_fields() {
+        let result = StepExecuteResult {
+            anchor_message_id: Some(42),
+            poll_id: Some("poll_123".into()),
+        };
+        assert_eq!(result.anchor_message_id, Some(42));
+        assert_eq!(result.poll_id, Some("poll_123".into()));
     }
 }
