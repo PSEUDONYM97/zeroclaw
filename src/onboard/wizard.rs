@@ -1281,6 +1281,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     bot_token: token,
                     allowed_users,
                     stt_endpoint: None,
+                    flows_enabled: false,
                 });
             }
             1 => {

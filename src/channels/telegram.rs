@@ -3,12 +3,55 @@ use super::telegram_types::{
     STT_TIMEOUT_SECS,
 };
 use super::traits::{Channel, ChannelMessage};
+use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+/// Maximum number of update_ids to track for dedup (bounded FIFO).
+const MAX_SEEN_UPDATES: usize = 10_000;
+
+/// Bounded seen-set for Telegram update_id dedup.
+struct SeenUpdates {
+    set: HashSet<i64>,
+    order: VecDeque<i64>,
+}
+
+impl SeenUpdates {
+    fn new() -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Insert an update_id. Returns `true` if new, `false` if duplicate.
+    fn insert(&mut self, uid: i64) -> bool {
+        if !self.set.insert(uid) {
+            return false;
+        }
+        self.order.push_back(uid);
+        while self.order.len() > MAX_SEEN_UPDATES {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
+}
+
+/// Build allowlist-based metadata JSON for Telegram events.
+/// Only includes explicitly listed fields -- never raw message content.
+pub fn build_telegram_metadata(fields: &[(&str, serde_json::Value)]) -> String {
+    let mut map = serde_json::Map::new();
+    for (k, v) in fields {
+        map.insert((*k).to_string(), v.clone());
+    }
+    serde_json::Value::Object(map).to_string()
+}
 
 /// Telegram channel -- long-polls the Bot API for updates
 pub struct TelegramChannel {
@@ -17,6 +60,8 @@ pub struct TelegramChannel {
     client: reqwest::Client,
     speech: Option<Arc<SpeechClient>>,
     stt_semaphore: Arc<tokio::sync::Semaphore>,
+    observer: Option<Arc<dyn Observer>>,
+    seen_update_ids: Arc<Mutex<SeenUpdates>>,
 }
 
 impl TelegramChannel {
@@ -27,6 +72,8 @@ impl TelegramChannel {
             client: reqwest::Client::new(),
             speech: None,
             stt_semaphore: Arc::new(tokio::sync::Semaphore::new(STT_CONCURRENCY)),
+            observer: None,
+            seen_update_ids: Arc::new(Mutex::new(SeenUpdates::new())),
         }
     }
 
@@ -34,6 +81,35 @@ impl TelegramChannel {
     pub fn with_stt(mut self, stt_endpoint: String) -> Self {
         self.speech = Some(Arc::new(SpeechClient::new(stt_endpoint)));
         self
+    }
+
+    /// Attach an observer for Telegram event instrumentation
+    pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Record a Telegram event on the observer (if present).
+    fn record_tg_event(
+        &self,
+        direction: &str,
+        event_type: &str,
+        status: &str,
+        chat_id: &str,
+        duration: Option<std::time::Duration>,
+        metadata: Option<String>,
+    ) {
+        if let Some(ref obs) = self.observer {
+            obs.record_event(&ObserverEvent::TelegramEvent {
+                direction: direction.to_string(),
+                event_type: event_type.to_string(),
+                status: status.to_string(),
+                chat_id: chat_id.to_string(),
+                correlation_id: Uuid::new_v4().to_string(),
+                duration,
+                metadata,
+            });
+        }
     }
 
     pub fn api_url(&self, method: &str) -> String {
@@ -763,6 +839,12 @@ impl Channel for TelegramChannel {
                     // Advance offset past this update
                     if let Some(uid) = update.get("update_id").and_then(serde_json::Value::as_i64) {
                         offset = uid + 1;
+
+                        // Dedup: skip if we've already processed this update_id
+                        if !self.seen_update_ids.lock().unwrap_or_else(|e| e.into_inner()).insert(uid) {
+                            tracing::debug!("Duplicate update_id {uid}, skipping");
+                            continue;
+                        }
                     }
 
                     // ── Handle callback_query ──────────────────────────
@@ -781,6 +863,25 @@ impl Channel for TelegramChannel {
                         if !self.is_any_user_allowed(cb_identities.iter().copied()) {
                             // Answer to dismiss spinner, then drop
                             let _ = self.answer_callback_query(&cb_id, Some("Unauthorized"), false).await;
+                            let cb_chat = cb["message"]["chat"]["id"]
+                                .as_i64()
+                                .map(|id| id.to_string())
+                                .unwrap_or_default();
+                            self.record_tg_event(
+                                "inbound",
+                                "tg.auth_reject",
+                                "rejected",
+                                &cb_chat,
+                                None,
+                                Some(build_telegram_metadata(&[
+                                    ("username", serde_json::json!(cb_username)),
+                                    ("user_id", serde_json::json!(cb_user_id)),
+                                    ("chat_id", serde_json::json!(cb_chat)),
+                                ])),
+                            );
+                            if let Some(ref obs) = self.observer {
+                                obs.record_metric(&ObserverMetric::CallbackRejectCount(1));
+                            }
                             continue;
                         }
 
@@ -793,6 +894,20 @@ impl Channel for TelegramChannel {
                             .map(|id| id.to_string())
                             .unwrap_or_default();
                         let original_msg_id = cb["message"]["message_id"].as_i64().unwrap_or_default();
+
+                        self.record_tg_event(
+                            "inbound",
+                            "tg.inbound.callback_query",
+                            "ok",
+                            &chat_id,
+                            None,
+                            Some(build_telegram_metadata(&[
+                                ("msg_type", serde_json::json!("callback_query")),
+                                ("callback_query_id", serde_json::json!(cb_id)),
+                                ("original_message_id", serde_json::json!(original_msg_id)),
+                                ("chat_id", serde_json::json!(&chat_id)),
+                            ])),
+                        );
 
                         let mut metadata = HashMap::new();
                         metadata.insert("msg_type".into(), serde_json::json!("callback_query"));
@@ -846,6 +961,24 @@ impl Channel for TelegramChannel {
 Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --channels-only`.",
                             user_id_str.as_deref().unwrap_or("unknown")
                         );
+                        let reject_chat = message
+                            .get("chat")
+                            .and_then(|c| c.get("id"))
+                            .and_then(serde_json::Value::as_i64)
+                            .map(|id| id.to_string())
+                            .unwrap_or_default();
+                        self.record_tg_event(
+                            "inbound",
+                            "tg.auth_reject",
+                            "rejected",
+                            &reject_chat,
+                            None,
+                            Some(build_telegram_metadata(&[
+                                ("username", serde_json::json!(username)),
+                                ("user_id", serde_json::json!(user_id_str)),
+                                ("chat_id", serde_json::json!(&reject_chat)),
+                            ])),
+                        );
                         continue;
                     }
 
@@ -873,10 +1006,23 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
 
                         // File-size guard
                         if file_size > MAX_VOICE_BYTES {
+                            self.record_tg_event(
+                                "inbound",
+                                "tg.guard_reject",
+                                "rejected",
+                                &chat_id,
+                                None,
+                                Some(build_telegram_metadata(&[
+                                    ("reason", serde_json::json!("file_too_large")),
+                                    ("chat_id", serde_json::json!(&chat_id)),
+                                    ("file_size", serde_json::json!(file_size)),
+                                    ("mime_type", serde_json::json!(&mime_type)),
+                                ])),
+                            );
                             let msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
                                 sender: chat_id.clone(),
-                                content: "[Voice message - too large for transcription]".to_string(),
+                                content: "[Voice message too large -- max 5 MB. Try a shorter recording.]".to_string(),
                                 channel: "telegram".to_string(),
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -892,10 +1038,22 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
 
                         // MIME type guard
                         if !ACCEPTED_AUDIO_TYPES.contains(&mime_type.as_str()) {
+                            self.record_tg_event(
+                                "inbound",
+                                "tg.guard_reject",
+                                "rejected",
+                                &chat_id,
+                                None,
+                                Some(build_telegram_metadata(&[
+                                    ("reason", serde_json::json!("unsupported_mime")),
+                                    ("chat_id", serde_json::json!(&chat_id)),
+                                    ("mime_type", serde_json::json!(&mime_type)),
+                                ])),
+                            );
                             let msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
                                 sender: chat_id.clone(),
-                                content: "[Voice message - unsupported format]".to_string(),
+                                content: "[Unsupported audio format. Send as .ogg, .mp3, .mp4, or .wav.]".to_string(),
                                 channel: "telegram".to_string(),
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -909,6 +1067,22 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                             continue;
                         }
 
+                        // Record inbound voice event
+                        self.record_tg_event(
+                            "inbound",
+                            "tg.inbound.voice",
+                            "ok",
+                            &chat_id,
+                            None,
+                            Some(build_telegram_metadata(&[
+                                ("msg_type", serde_json::json!("voice")),
+                                ("file_id", serde_json::json!(&file_id)),
+                                ("duration_secs", serde_json::json!(duration)),
+                                ("mime_type", serde_json::json!(&mime_type)),
+                                ("chat_id", serde_json::json!(&chat_id)),
+                            ])),
+                        );
+
                         // Non-blocking STT transcription
                         if let Some(ref speech) = self.speech {
                             let speech = speech.clone();
@@ -916,6 +1090,8 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                             let semaphore = self.stt_semaphore.clone();
                             let bot_token = self.bot_token.clone();
                             let client = self.client.clone();
+                            let observer = self.observer.clone();
+                            let stt_chat_id = chat_id.clone();
                             let api_base =
                                 format!("https://api.telegram.org/bot{}", bot_token);
 
@@ -927,7 +1103,7 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                                         let msg = ChannelMessage {
                                             id: Uuid::new_v4().to_string(),
                                             sender: chat_id,
-                                            content: "[Voice message - busy, try again]"
+                                            content: "[Voice transcription busy -- please wait a moment and try again.]"
                                                 .to_string(),
                                             channel: "telegram".to_string(),
                                             timestamp: std::time::SystemTime::now()
@@ -1063,6 +1239,7 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                                     .rsplit('.')
                                     .next()
                                     .unwrap_or("ogg");
+                                let stt_start = tokio::time::Instant::now();
                                 let transcript = tokio::time::timeout(
                                     std::time::Duration::from_secs(STT_TIMEOUT_SECS),
                                     speech.transcribe(audio_bytes, format_ext),
@@ -1070,14 +1247,62 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                                 .await;
 
                                 let content = match transcript {
-                                    Ok(Ok(result)) => result.text,
+                                    Ok(Ok(result)) => {
+                                        if let Some(ref obs) = observer {
+                                            let latency = stt_start.elapsed();
+                                            obs.record_event(&ObserverEvent::TelegramEvent {
+                                                direction: String::new(),
+                                                event_type: "tg.stt.success".to_string(),
+                                                status: "ok".to_string(),
+                                                chat_id: stt_chat_id.clone(),
+                                                correlation_id: Uuid::new_v4().to_string(),
+                                                duration: Some(latency),
+                                                metadata: Some(build_telegram_metadata(&[
+                                                    ("chat_id", serde_json::json!(&stt_chat_id)),
+                                                    ("latency_ms", serde_json::json!(latency.as_millis() as u64)),
+                                                ])),
+                                            });
+                                            obs.record_metric(&ObserverMetric::SttLatency(latency));
+                                        }
+                                        result.text
+                                    }
                                     Ok(Err(e)) => {
                                         tracing::warn!("STT transcription error: {e}");
-                                        "[Voice message]".to_string()
+                                        if let Some(ref obs) = observer {
+                                            obs.record_event(&ObserverEvent::TelegramEvent {
+                                                direction: String::new(),
+                                                event_type: "tg.stt.error".to_string(),
+                                                status: "error".to_string(),
+                                                chat_id: stt_chat_id.clone(),
+                                                correlation_id: Uuid::new_v4().to_string(),
+                                                duration: Some(stt_start.elapsed()),
+                                                metadata: Some(build_telegram_metadata(&[
+                                                    ("chat_id", serde_json::json!(&stt_chat_id)),
+                                                    ("reason", serde_json::json!("transcription_error")),
+                                                ])),
+                                            });
+                                            obs.record_metric(&ObserverMetric::SttErrorCount(1));
+                                        }
+                                        "[Voice transcription failed. Your message was received but could not be transcribed.]".to_string()
                                     }
                                     Err(_) => {
                                         tracing::warn!("STT transcription timed out");
-                                        "[Voice message - transcription timed out]".to_string()
+                                        if let Some(ref obs) = observer {
+                                            obs.record_event(&ObserverEvent::TelegramEvent {
+                                                direction: String::new(),
+                                                event_type: "tg.stt.error".to_string(),
+                                                status: "error".to_string(),
+                                                chat_id: stt_chat_id.clone(),
+                                                correlation_id: Uuid::new_v4().to_string(),
+                                                duration: Some(stt_start.elapsed()),
+                                                metadata: Some(build_telegram_metadata(&[
+                                                    ("chat_id", serde_json::json!(&stt_chat_id)),
+                                                    ("reason", serde_json::json!("timeout")),
+                                                ])),
+                                            });
+                                            obs.record_metric(&ObserverMetric::SttErrorCount(1));
+                                        }
+                                        format!("[Transcription timed out after {STT_TIMEOUT_SECS}s. Try a shorter message or try again.]")
                                     }
                                 };
 
@@ -1118,6 +1343,17 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
 
                     // ── Photo message ──────────────────────────────────
                     if let Some(photos) = message.get("photo").and_then(|p| p.as_array()) {
+                        self.record_tg_event(
+                            "inbound",
+                            "tg.inbound.photo",
+                            "ok",
+                            &chat_id,
+                            None,
+                            Some(build_telegram_metadata(&[
+                                ("msg_type", serde_json::json!("photo")),
+                                ("chat_id", serde_json::json!(&chat_id)),
+                            ])),
+                        );
                         // Telegram sends multiple sizes; take the largest (last)
                         let best = photos.last();
                         let file_id = best
@@ -1154,6 +1390,17 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
 
                     // ── Document message ───────────────────────────────
                     if let Some(doc) = message.get("document") {
+                        self.record_tg_event(
+                            "inbound",
+                            "tg.inbound.document",
+                            "ok",
+                            &chat_id,
+                            None,
+                            Some(build_telegram_metadata(&[
+                                ("msg_type", serde_json::json!("document")),
+                                ("chat_id", serde_json::json!(&chat_id)),
+                            ])),
+                        );
                         let file_id = doc["file_id"]
                             .as_str()
                             .unwrap_or_default()
@@ -1197,6 +1444,18 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                     let Some(text) = message.get("text").and_then(serde_json::Value::as_str) else {
                         continue;
                     };
+
+                    self.record_tg_event(
+                        "inbound",
+                        "tg.inbound.text",
+                        "ok",
+                        &chat_id,
+                        None,
+                        Some(build_telegram_metadata(&[
+                            ("msg_type", serde_json::json!("text")),
+                            ("chat_id", serde_json::json!(&chat_id)),
+                        ])),
+                    );
 
                     // Send "typing" indicator immediately when we receive a message
                     let typing_body = serde_json::json!({

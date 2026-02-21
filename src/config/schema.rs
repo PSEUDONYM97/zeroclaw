@@ -727,6 +727,9 @@ pub struct TelegramConfig {
     /// External STT endpoint for voice transcription (e.g. "http://localhost:9000")
     #[serde(default)]
     pub stt_endpoint: Option<String>,
+    /// Enable declarative conversation flows (loads from workspace/flows/*.toml)
+    #[serde(default)]
+    pub flows_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1180,6 +1183,7 @@ mod tests {
                     bot_token: "123:ABC".into(),
                     allowed_users: vec!["user1".into()],
                     stt_endpoint: None,
+                    flows_enabled: false,
                 }),
                 discord: None,
                 slack: None,
@@ -1322,6 +1326,7 @@ default_temperature = 0.7
             bot_token: "123:XYZ".into(),
             allowed_users: vec!["alice".into(), "bob".into()],
             stt_endpoint: None,
+            flows_enabled: false,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();

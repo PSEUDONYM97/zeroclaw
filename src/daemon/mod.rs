@@ -290,6 +290,7 @@ mod tests {
             bot_token: "token".into(),
             allowed_users: vec![],
             stt_endpoint: None,
+            flows_enabled: false,
         });
         assert!(has_supervised_channels(&config));
     }

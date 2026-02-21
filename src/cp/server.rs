@@ -152,6 +152,19 @@ pub fn build_router(state: CpState) -> Router {
             "/messages/:id/acknowledge",
             post(messaging::handle_acknowledge_message),
         )
+        // Phase 15.5: Telegram observability endpoints
+        .route(
+            "/instances/:name/telegram/events",
+            get(handle_telegram_events),
+        )
+        .route(
+            "/instances/:name/telegram/events/:event_id",
+            get(handle_telegram_event_detail),
+        )
+        .route(
+            "/instances/:name/telegram/health",
+            get(handle_telegram_health),
+        )
         .fallback(handle_api_fallback);
 
     Router::new()
@@ -2191,6 +2204,284 @@ async fn handle_config_diff(
             "unchanged_count": diff.unchanged_count,
             "unknown_fields_warning": unknown_fields_warning,
         }))
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── Telegram observability endpoints (Phase 15.5) ───────────────
+
+#[derive(Deserialize)]
+struct TelegramEventsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    event_type: Option<String>,
+    status: Option<String>,
+    chat_id: Option<String>,
+    correlation_id: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
+}
+
+async fn handle_telegram_events(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+    Query(query): Query<TelegramEventsQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=1000).contains(&limit) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "Invalid limit: must be between 1 and 1000",
+        );
+    }
+    let offset = query.offset.unwrap_or(0);
+    if offset > 100_000 {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "Invalid offset: must be at most 100000",
+        );
+    }
+
+    let db_path = state.db_path.clone();
+    let event_type = query.event_type.clone();
+    let status_filter = query.status.clone();
+    let chat_id = query.chat_id.clone();
+    let correlation_id = query.correlation_id.clone();
+    let after = query.after.clone();
+    let before = query.before.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to query instance",
+                );
+            }
+        };
+
+        match registry.list_telegram_events(
+            &instance.id,
+            limit,
+            offset,
+            event_type.as_deref(),
+            status_filter.as_deref(),
+            chat_id.as_deref(),
+            correlation_id.as_deref(),
+            after.as_deref(),
+            before.as_deref(),
+        ) {
+            Ok((events, total)) => {
+                let event_list: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "id": e.id,
+                            "instance_id": e.instance_id,
+                            "event_type": e.event_type,
+                            "channel": e.channel,
+                            "summary": e.summary,
+                            "status": e.status,
+                            "duration_ms": e.duration_ms,
+                            "correlation_id": e.correlation_id,
+                            "metadata": e.metadata.as_ref().and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok()),
+                            "created_at": e.created_at,
+                        })
+                    })
+                    .collect();
+
+                ok_json(serde_json::json!({
+                    "events": event_list,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                }))
+            }
+            Err(e) => {
+                tracing::error!("Failed to list telegram events: {e:#}");
+                err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to list telegram events",
+                )
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+async fn handle_telegram_event_detail(
+    State(state): State<CpState>,
+    AxumPath((name, event_id)): AxumPath<(String, String)>,
+) -> impl IntoResponse {
+    let db_path = state.db_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        match registry.get_instance_by_name(&name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to query instance",
+                );
+            }
+        };
+
+        match registry.get_agent_event_by_id(&event_id) {
+            Ok(Some(event)) => {
+                let metadata_json = event
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok());
+
+                ok_json(serde_json::json!({
+                    "id": event.id,
+                    "instance_id": event.instance_id,
+                    "event_type": event.event_type,
+                    "channel": event.channel,
+                    "summary": event.summary,
+                    "status": event.status,
+                    "duration_ms": event.duration_ms,
+                    "correlation_id": event.correlation_id,
+                    "metadata": metadata_json,
+                    "created_at": event.created_at,
+                }))
+            }
+            Ok(None) => err_json(
+                StatusCode::NOT_FOUND,
+                &format!("No event with id '{event_id}'"),
+            ),
+            Err(e) => {
+                tracing::error!("Failed to query event: {e:#}");
+                err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to query event",
+                )
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct TelegramHealthQuery {
+    window: Option<String>,
+}
+
+async fn handle_telegram_health(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+    Query(query): Query<TelegramHealthQuery>,
+) -> impl IntoResponse {
+    let window_str = query.window.as_deref().unwrap_or("5m").to_string();
+    let window_minutes: u64 = match window_str.as_str() {
+        "1m" => 1,
+        "5m" => 5,
+        "15m" => 15,
+        "1h" => 60,
+        other => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid window '{other}'. Valid: 1m, 5m, 15m, 1h"),
+            );
+        }
+    };
+
+    let db_path = state.db_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to query instance",
+                );
+            }
+        };
+
+        match registry.telegram_health_counters(&instance.id, window_minutes) {
+            Ok(counters) => ok_json(serde_json::json!({
+                "window": window_str,
+                "counters": {
+                    "events_per_min": counters.events_per_min,
+                    "callback_reject_rate": counters.callback_reject_rate,
+                    "stt_error_rate": counters.stt_error_rate,
+                    "stt_p95_latency_ms": counters.stt_p95_latency_ms,
+                    "inbound_count": counters.inbound_count,
+                    "outbound_count": counters.outbound_count,
+                    "auth_reject_count": counters.auth_reject_count,
+                    "guard_reject_count": counters.guard_reject_count,
+                }
+            })),
+            Err(e) => {
+                tracing::error!("Failed to compute telegram health counters: {e:#}");
+                err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to compute health counters",
+                )
+            }
+        }
     })
     .await;
 

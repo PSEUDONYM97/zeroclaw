@@ -9,6 +9,7 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod screenshot;
 pub mod shell;
+pub mod telegram_flow;
 pub mod telegram_rich;
 pub mod traits;
 
@@ -127,6 +128,23 @@ pub fn telegram_tools(
         )),
         Box::new(telegram_rich::TelegramEditTool::new(channel, context)),
     ]
+}
+
+/// Create Telegram tools including the flow tool (when flows are enabled).
+pub fn telegram_tools_with_flows(
+    channel: Arc<TelegramChannel>,
+    context: Arc<Mutex<Option<TelegramToolContext>>>,
+    flow_defs: Arc<std::collections::HashMap<String, crate::flows::types::FlowDefinition>>,
+    flow_store: Arc<crate::flows::state::FlowStore>,
+) -> Vec<Box<dyn Tool>> {
+    let mut tools = telegram_tools(channel.clone(), context.clone());
+    tools.push(Box::new(telegram_flow::TelegramFlowTool::new(
+        channel,
+        context,
+        flow_defs,
+        flow_store,
+    )));
+    tools
 }
 
 #[cfg(test)]
