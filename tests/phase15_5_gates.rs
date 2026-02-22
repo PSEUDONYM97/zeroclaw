@@ -372,7 +372,7 @@ fn flow_tool_schema() {
     let ctx = Arc::new(Mutex::new(None::<TelegramToolContext>));
     let defs = Arc::new(HashMap::new());
     let store = Arc::new(FlowStore::new());
-    let tool = TelegramFlowTool::new(ch, ctx, defs, store);
+    let tool = TelegramFlowTool::new(ch, ctx, defs, store, None);
 
     assert_eq!(tool.name(), "telegram_start_flow");
     let schema = tool.parameters_schema();

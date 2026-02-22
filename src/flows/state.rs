@@ -159,6 +159,16 @@ impl FlowStore {
             .contains_key(chat_id)
     }
 
+    /// Return the set of distinct flow_names currently active across all chats.
+    pub fn active_flow_names(&self) -> std::collections::HashSet<String> {
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|inst| inst.flow_name.clone())
+            .collect()
+    }
+
     /// Advance the flow to a new step.
     pub fn advance(
         &self,

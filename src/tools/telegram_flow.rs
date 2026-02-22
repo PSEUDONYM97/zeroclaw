@@ -1,5 +1,6 @@
 use crate::channels::telegram::TelegramChannel;
 use crate::channels::telegram_types::TelegramToolContext;
+use crate::flows::db::FlowDb;
 use crate::flows::execute::execute_step;
 use crate::flows::state::FlowStore;
 use crate::flows::types::FlowDefinition;
@@ -25,11 +26,15 @@ fn resolve_chat_id(
 }
 
 /// Tool: `telegram_start_flow` -- triggers a validated declarative flow.
+///
+/// Looks up flow definitions in the operator TOML map first, then falls back
+/// to the DB for agent-authored active versions.
 pub struct TelegramFlowTool {
     channel: Arc<TelegramChannel>,
     context: Arc<Mutex<Option<TelegramToolContext>>>,
     flow_defs: Arc<HashMap<String, FlowDefinition>>,
     flow_store: Arc<FlowStore>,
+    flow_db: Option<Arc<FlowDb>>,
 }
 
 impl TelegramFlowTool {
@@ -38,12 +43,14 @@ impl TelegramFlowTool {
         context: Arc<Mutex<Option<TelegramToolContext>>>,
         flow_defs: Arc<HashMap<String, FlowDefinition>>,
         flow_store: Arc<FlowStore>,
+        flow_db: Option<Arc<FlowDb>>,
     ) -> Self {
         Self {
             channel,
             context,
             flow_defs,
             flow_store,
+            flow_db,
         }
     }
 }
@@ -98,24 +105,81 @@ impl Tool for TelegramFlowTool {
             }
         };
 
-        let flow_def = match self.flow_defs.get(&flow_name) {
-            Some(def) => def,
-            None => {
-                let available: Vec<&str> = self.flow_defs.keys().map(|k| k.as_str()).collect();
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Flow '{}' not found. Available flows: {}",
-                        flow_name,
-                        if available.is_empty() {
-                            "none".to_string()
-                        } else {
-                            available.join(", ")
+        // Look up flow definition: operator TOML first, then DB fallback
+        let db_flow_def: Option<FlowDefinition>;
+        let flow_def = if let Some(def) = self.flow_defs.get(&flow_name) {
+            def
+        } else if let Some(ref db) = self.flow_db {
+            // DB fallback for agent-authored active flows
+            match db.get_active_version(&flow_name) {
+                Ok(Some(row)) => {
+                    let toml_def: crate::flows::types::FlowDefinitionToml =
+                        match serde_json::from_str(&row.definition_json) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(format!(
+                                        "Flow '{}' has invalid definition in DB: {e}",
+                                        flow_name
+                                    )),
+                                });
+                            }
+                        };
+                    match crate::flows::validate::build_flow_definition(&toml_def) {
+                        Ok(def) => {
+                            db_flow_def = Some(def);
+                            db_flow_def.as_ref().unwrap()
                         }
-                    )),
-                });
+                        Err(errors) => {
+                            let msgs: Vec<String> =
+                                errors.iter().map(|e| e.message.clone()).collect();
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!(
+                                    "Flow '{}' DB definition failed validation: {}",
+                                    flow_name,
+                                    msgs.join("; ")
+                                )),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    let available: Vec<&str> =
+                        self.flow_defs.keys().map(|k| k.as_str()).collect();
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Flow '{}' not found. Available flows: {}",
+                            flow_name,
+                            if available.is_empty() {
+                                "none".to_string()
+                            } else {
+                                available.join(", ")
+                            }
+                        )),
+                    });
+                }
             }
+        } else {
+            let available: Vec<&str> = self.flow_defs.keys().map(|k| k.as_str()).collect();
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Flow '{}' not found. Available flows: {}",
+                    flow_name,
+                    if available.is_empty() {
+                        "none".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                )),
+            });
         };
 
         let start_step = match flow_def.steps.get(&flow_def.start_step) {
@@ -183,7 +247,7 @@ mod tests {
         let ctx = Arc::new(Mutex::new(None));
         let defs = Arc::new(HashMap::new());
         let store = Arc::new(FlowStore::new());
-        let tool = TelegramFlowTool::new(ch, ctx, defs, store);
+        let tool = TelegramFlowTool::new(ch, ctx, defs, store, None);
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["flow_name"].is_object());
         assert_eq!(tool.name(), "telegram_start_flow");
@@ -195,7 +259,7 @@ mod tests {
         let ctx = Arc::new(Mutex::new(None));
         let defs = Arc::new(HashMap::new());
         let store = Arc::new(FlowStore::new());
-        let tool = TelegramFlowTool::new(ch, ctx, defs, store);
+        let tool = TelegramFlowTool::new(ch, ctx, defs, store, None);
         let schema = tool.parameters_schema();
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("flow_name")));

@@ -291,6 +291,7 @@ mod tests {
             allowed_users: vec![],
             stt_endpoint: None,
             flows_enabled: false,
+            flow_policy: crate::config::FlowPolicyConfig::default(),
         });
         assert!(has_supervised_channels(&config));
     }

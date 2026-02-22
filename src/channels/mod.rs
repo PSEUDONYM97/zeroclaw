@@ -604,12 +604,20 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 ch = ch.with_flow_db(db.clone());
             }
             let arc = Arc::new(ch);
+            let tg_flow_policy = config
+                .channels_config
+                .telegram
+                .as_ref()
+                .map(|t| t.flow_policy.clone())
+                .unwrap_or_default();
             if flows_enabled && !flow_defs.is_empty() {
                 tools_registry.extend(tools::telegram_tools_with_flows(
                     arc.clone(),
                     telegram_context.clone(),
                     flow_defs.clone(),
                     flow_store.clone(),
+                    flow_db.clone(),
+                    tg_flow_policy.clone(),
                 ));
             } else {
                 tools_registry.extend(tools::telegram_tools(arc.clone(), telegram_context.clone()));
@@ -824,22 +832,83 @@ pub async fn start_channels(config: Config) -> Result<()> {
     drop(tx); // Drop our copy so rx closes when all channels stop
 
     // ── Spawn flow timeout checker (if flows enabled) ───────────
-    if flows_enabled && !flow_defs.is_empty() {
+    // Run when TOML flows exist OR when flow_db is available (agent-authored flows)
+    if flows_enabled && (!flow_defs.is_empty() || flow_db.is_some()) {
         let timeout_store = flow_store.clone();
         let timeout_defs = flow_defs.clone();
         let timeout_tg = telegram_channel_arc.clone();
+        let timeout_flow_db = flow_db.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            // Version-aware cache for agent-authored flows loaded from DB.
+            // Keyed by flow_name -> (version_id, FlowDefinition). Only re-parsed
+            // when the active version changes.
+            let mut db_flow_cache: std::collections::HashMap<
+                String,
+                (i64, crate::flows::types::FlowDefinition),
+            > = std::collections::HashMap::new();
             loop {
                 interval.tick().await;
                 // Sync cache with DB (picks up CP mutations within 5s)
                 if let Err(e) = timeout_store.refresh_from_db() {
                     tracing::warn!("Flow store refresh failed: {e}");
                 }
-                let timed_out = timeout_store.check_timeouts(&timeout_defs);
+
+                // Eagerly populate DB cache for active agent-authored flows
+                // so check_timeouts can see them in the merged HashMap.
+                if let Some(ref db) = timeout_flow_db {
+                    let active_names = timeout_store.active_flow_names();
+                    for name in &active_names {
+                        if timeout_defs.contains_key(name) {
+                            continue; // operator TOML flow, skip
+                        }
+                        match db.get_active_version(name) {
+                            Ok(Some(row)) => {
+                                let cached_valid = db_flow_cache
+                                    .get(name)
+                                    .map(|(cid, _)| *cid == row.id)
+                                    .unwrap_or(false);
+                                if !cached_valid {
+                                    if let Ok(toml_def) = serde_json::from_str::<
+                                        crate::flows::types::FlowDefinitionToml,
+                                    >(
+                                        &row.definition_json
+                                    ) {
+                                        if let Ok(def) =
+                                            crate::flows::validate::build_flow_definition(&toml_def)
+                                        {
+                                            db_flow_cache.insert(name.clone(), (row.id, def));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                db_flow_cache.remove(name);
+                            }
+                        }
+                    }
+                }
+
+                // Build merged HashMap: operator TOML defs + cached DB defs
+                let merged_defs = if db_flow_cache.is_empty() {
+                    // Fast path: no agent flows, just use operator defs directly
+                    std::borrow::Cow::Borrowed(timeout_defs.as_ref())
+                } else {
+                    let mut m = timeout_defs.as_ref().clone();
+                    for (name, (_, def)) in &db_flow_cache {
+                        m.entry(name.clone()).or_insert_with(|| def.clone());
+                    }
+                    std::borrow::Cow::Owned(m)
+                };
+
+                let timed_out = timeout_store.check_timeouts(&merged_defs);
                 for (chat_id, flow_name, step_id) in timed_out {
                     tracing::info!("Flow '{flow_name}' step '{step_id}' timed out for chat {chat_id}");
-                    if let Some(flow_def) = timeout_defs.get(&flow_name) {
+
+                    // Resolve flow definition from merged set
+                    let flow_def_resolved = merged_defs.get(&flow_name);
+
+                    if let Some(flow_def) = flow_def_resolved {
                         if let Some(step) = flow_def.steps.get(&step_id) {
                             // Look for _timeout transition
                             let timeout_target = step
@@ -938,7 +1007,21 @@ pub async fn start_channels(config: Config) -> Result<()> {
             if let Some((flow_name, current_step_id, anchor_msg_id)) =
                 flow_store.get_flow_info(&chat_id)
             {
-                if let Some(flow_def) = flow_defs.get(&flow_name) {
+                // Resolve flow definition: operator TOML first, then DB fallback
+                let cb_db_flow_def: Option<crate::flows::types::FlowDefinition>;
+                let cb_flow_def = if let Some(def) = flow_defs.get(&flow_name) {
+                    Some(def)
+                } else if let Some(ref db) = flow_db {
+                    cb_db_flow_def = db.get_active_version(&flow_name).ok().flatten().and_then(|row| {
+                        let toml_def: crate::flows::types::FlowDefinitionToml =
+                            serde_json::from_str(&row.definition_json).ok()?;
+                        crate::flows::validate::build_flow_definition(&toml_def).ok()
+                    });
+                    cb_db_flow_def.as_ref()
+                } else {
+                    None
+                };
+                if let Some(flow_def) = cb_flow_def {
                     if let Some(current_step) = flow_def.steps.get(&current_step_id) {
                         // Find matching transition
                         let matched_transition = current_step

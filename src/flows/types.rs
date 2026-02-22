@@ -1,16 +1,16 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // ── TOML-parsed types ───────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowDefinitionToml {
     pub flow: FlowMeta,
     #[serde(default)]
     pub steps: Vec<StepToml>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowMeta {
     pub name: String,
     #[serde(default)]
@@ -20,7 +20,7 @@ pub struct FlowMeta {
     pub default_timeout_secs: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepToml {
     pub id: String,
     pub kind: StepKind,
@@ -40,7 +40,7 @@ pub struct StepToml {
     pub transitions: Vec<TransitionDef>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum StepKind {
     Keyboard,
@@ -49,13 +49,13 @@ pub enum StepKind {
     Edit,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ButtonDef {
     pub text: String,
     pub callback_data: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionDef {
     pub on: String,
     pub target: String,
@@ -96,6 +96,32 @@ impl Step {
     pub fn effective_timeout(&self, flow_default: u64) -> u64 {
         self.timeout_secs.unwrap_or(flow_default)
     }
+}
+
+// ── DB row types for flow versioning ────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct FlowVersionRow {
+    pub id: i64,
+    pub flow_name: String,
+    pub version: i64,
+    pub source: String,
+    pub status: String,
+    pub definition_json: String,
+    pub created_at: String,
+    pub created_by: String,
+    pub review_note: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlowAuditRow {
+    pub id: i64,
+    pub flow_name: String,
+    pub version: Option<i64>,
+    pub event: String,
+    pub actor: String,
+    pub detail: Option<String>,
+    pub created_at: String,
 }
 
 #[cfg(test)]

@@ -1282,6 +1282,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                     stt_endpoint: None,
                     flows_enabled: false,
+                    flow_policy: crate::config::FlowPolicyConfig::default(),
                 });
             }
             1 => {

@@ -1,4 +1,5 @@
-use rusqlite::{params, Connection, OpenFlags};
+use crate::flows::types::{FlowAuditRow, FlowVersionRow};
+use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -120,7 +121,43 @@ impl FlowDb {
                  key              TEXT PRIMARY KEY NOT NULL,
                  value            TEXT NOT NULL,
                  updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
-             );",
+             );
+
+             -- Phase 17: Flow versioning (agent-authored flows)
+             CREATE TABLE IF NOT EXISTS flow_versions (
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                 flow_name       TEXT NOT NULL,
+                 version         INTEGER NOT NULL,
+                 source          TEXT NOT NULL DEFAULT 'operator',
+                 status          TEXT NOT NULL DEFAULT 'draft',
+                 definition_json TEXT NOT NULL,
+                 created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                 created_by      TEXT NOT NULL DEFAULT 'system',
+                 review_note     TEXT,
+                 UNIQUE(flow_name, version)
+             );
+             CREATE INDEX IF NOT EXISTS idx_fv_name_status ON flow_versions(flow_name, status);
+             CREATE INDEX IF NOT EXISTS idx_fv_status ON flow_versions(status);
+
+             CREATE TABLE IF NOT EXISTS flow_audit_log (
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                 flow_name       TEXT NOT NULL,
+                 version         INTEGER,
+                 event           TEXT NOT NULL,
+                 actor           TEXT NOT NULL,
+                 detail          TEXT,
+                 created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE INDEX IF NOT EXISTS idx_fal_name ON flow_audit_log(flow_name);
+             CREATE INDEX IF NOT EXISTS idx_fal_created ON flow_audit_log(created_at DESC);
+
+             -- Append-only protection: prevent tampering with audit trail
+             CREATE TRIGGER IF NOT EXISTS prevent_audit_update
+                 BEFORE UPDATE ON flow_audit_log
+                 BEGIN SELECT RAISE(ABORT, 'flow_audit_log is append-only'); END;
+             CREATE TRIGGER IF NOT EXISTS prevent_audit_delete
+                 BEFORE DELETE ON flow_audit_log
+                 BEGIN SELECT RAISE(ABORT, 'flow_audit_log is append-only'); END;",
         )?;
         Ok(())
     }
@@ -395,6 +432,298 @@ impl FlowDb {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    // ── Flow Versions (Phase 17) ────────────────────────────────
+
+    /// Create a new flow version with race-safe auto-increment.
+    /// Uses IMMEDIATE transaction to serialize concurrent writers.
+    /// Returns the assigned version number.
+    pub fn create_flow_version(
+        &self,
+        flow_name: &str,
+        definition_json: &str,
+        source: &str,
+        created_by: &str,
+    ) -> anyhow::Result<i64> {
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let next_version: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM flow_versions WHERE flow_name = ?1",
+            [flow_name],
+            |row| row.get(0),
+        )?;
+
+        tx.execute(
+            "INSERT INTO flow_versions (flow_name, version, source, status, definition_json, created_by)
+             VALUES (?1, ?2, ?3, 'draft', ?4, ?5)",
+            params![flow_name, next_version, source, definition_json, created_by],
+        )?;
+
+        tx.commit()?;
+        Ok(next_version)
+    }
+
+    /// Get a specific version of a flow.
+    pub fn get_flow_version(
+        &self,
+        flow_name: &str,
+        version: i64,
+    ) -> anyhow::Result<Option<FlowVersionRow>> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare(
+            "SELECT id, flow_name, version, source, status, definition_json,
+                    created_at, created_by, review_note
+             FROM flow_versions WHERE flow_name = ?1 AND version = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![flow_name, version], Self::map_version_row)?;
+        match rows.next() {
+            Some(Ok(r)) => Ok(Some(r)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Get the currently active version of a flow (status = 'active').
+    pub fn get_active_version(&self, flow_name: &str) -> anyhow::Result<Option<FlowVersionRow>> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare(
+            "SELECT id, flow_name, version, source, status, definition_json,
+                    created_at, created_by, review_note
+             FROM flow_versions WHERE flow_name = ?1 AND status = 'active'
+             ORDER BY version DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![flow_name], Self::map_version_row)?;
+        match rows.next() {
+            Some(Ok(r)) => Ok(Some(r)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// List all versions of a flow, ordered by version descending.
+    pub fn list_flow_versions(&self, flow_name: &str) -> anyhow::Result<Vec<FlowVersionRow>> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare(
+            "SELECT id, flow_name, version, source, status, definition_json,
+                    created_at, created_by, review_note
+             FROM flow_versions WHERE flow_name = ?1
+             ORDER BY version DESC",
+        )?;
+        let rows = stmt.query_map(params![flow_name], Self::map_version_row)?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
+    /// List all versions with status = 'pending_review'.
+    pub fn list_pending_review(&self) -> anyhow::Result<Vec<FlowVersionRow>> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare(
+            "SELECT id, flow_name, version, source, status, definition_json,
+                    created_at, created_by, review_note
+             FROM flow_versions WHERE status = 'pending_review'
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], Self::map_version_row)?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
+    /// Update the status of a specific flow version. Returns true if a row was updated.
+    pub fn update_version_status(
+        &self,
+        flow_name: &str,
+        version: i64,
+        new_status: &str,
+        review_note: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = guard.execute(
+            "UPDATE flow_versions SET status = ?3, review_note = ?4
+             WHERE flow_name = ?1 AND version = ?2",
+            params![flow_name, version, new_status, review_note],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Activate a specific version: deactivate the current active version (if any),
+    /// then set the target version to 'active'. Uses IMMEDIATE transaction.
+    pub fn activate_version(&self, flow_name: &str, version: i64) -> anyhow::Result<()> {
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Deactivate any currently active version
+        tx.execute(
+            "UPDATE flow_versions SET status = 'deactivated'
+             WHERE flow_name = ?1 AND status = 'active'",
+            params![flow_name],
+        )?;
+
+        // Activate the target version
+        let changed = tx.execute(
+            "UPDATE flow_versions SET status = 'active'
+             WHERE flow_name = ?1 AND version = ?2",
+            params![flow_name, version],
+        )?;
+
+        if changed == 0 {
+            tx.rollback()?;
+            anyhow::bail!(
+                "flow version {flow_name} v{version} not found; cannot activate"
+            );
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Count distinct flow_names with source = 'agent'.
+    pub fn count_agent_flows(&self) -> anyhow::Result<usize> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count: usize = guard.query_row(
+            "SELECT COUNT(DISTINCT flow_name) FROM flow_versions WHERE source = 'agent'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Check if any version exists with source = 'operator' for this flow name.
+    pub fn has_operator_versions(&self, flow_name: &str) -> anyhow::Result<bool> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM flow_versions WHERE flow_name = ?1 AND source = 'operator'",
+            params![flow_name],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    // ── Audit Log (Phase 17) ────────────────────────────────────
+
+    /// Append an entry to the flow audit log.
+    pub fn log_audit(
+        &self,
+        flow_name: &str,
+        version: Option<i64>,
+        event: &str,
+        actor: &str,
+        detail: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        guard.execute(
+            "INSERT INTO flow_audit_log (flow_name, version, event, actor, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![flow_name, version, event, actor, detail],
+        )?;
+        Ok(())
+    }
+
+    /// List audit log entries with pagination and optional flow_name filter.
+    /// Returns (rows, total_count).
+    pub fn list_audit_log(
+        &self,
+        limit: usize,
+        offset: usize,
+        flow_name_filter: Option<&str>,
+    ) -> anyhow::Result<(Vec<FlowAuditRow>, usize)> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+
+        let (where_sql, bind_name) = if let Some(name) = flow_name_filter {
+            ("WHERE flow_name = ?1".to_string(), Some(name.to_string()))
+        } else {
+            (String::new(), None)
+        };
+
+        // Count
+        let count_sql = format!("SELECT COUNT(*) FROM flow_audit_log {where_sql}");
+        let total: usize = if let Some(ref name) = bind_name {
+            let mut stmt = guard.prepare(&count_sql)?;
+            stmt.query_row(params![name], |row| row.get(0))?
+        } else {
+            let mut stmt = guard.prepare(&count_sql)?;
+            stmt.query_row([], |row| row.get(0))?
+        };
+
+        // Rows
+        let query_sql = if bind_name.is_some() {
+            format!(
+                "SELECT id, flow_name, version, event, actor, detail, created_at
+                 FROM flow_audit_log {where_sql}
+                 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
+            )
+        } else {
+            format!(
+                "SELECT id, flow_name, version, event, actor, detail, created_at
+                 FROM flow_audit_log {where_sql}
+                 ORDER BY created_at DESC LIMIT ?1 OFFSET ?2"
+            )
+        };
+
+        let mut result = Vec::new();
+        if let Some(ref name) = bind_name {
+            let mut stmt = guard.prepare(&query_sql)?;
+            let rows = stmt.query_map(
+                params![name, limit as i64, offset as i64],
+                Self::map_audit_row,
+            )?;
+            for r in rows {
+                result.push(r?);
+            }
+        } else {
+            let mut stmt = guard.prepare(&query_sql)?;
+            let rows = stmt.query_map(
+                params![limit as i64, offset as i64],
+                Self::map_audit_row,
+            )?;
+            for r in rows {
+                result.push(r?);
+            }
+        }
+
+        Ok((result, total))
+    }
+
+    // ── Internal row mappers ────────────────────────────────────
+
+    fn map_version_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowVersionRow> {
+        Ok(FlowVersionRow {
+            id: row.get(0)?,
+            flow_name: row.get(1)?,
+            version: row.get(2)?,
+            source: row.get(3)?,
+            status: row.get(4)?,
+            definition_json: row.get(5)?,
+            created_at: row.get(6)?,
+            created_by: row.get(7)?,
+            review_note: row.get(8)?,
+        })
+    }
+
+    fn map_audit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowAuditRow> {
+        Ok(FlowAuditRow {
+            id: row.get(0)?,
+            flow_name: row.get(1)?,
+            version: row.get(2)?,
+            event: row.get(3)?,
+            actor: row.get(4)?,
+            detail: row.get(5)?,
+            created_at: row.get(6)?,
+        })
+    }
+
+    /// Expose the inner connection for direct SQL access.
+    ///
+    /// Intended for tests and advanced use cases (e.g., verifying trigger behavior).
+    pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

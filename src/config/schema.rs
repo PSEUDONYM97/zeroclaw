@@ -730,6 +730,68 @@ pub struct TelegramConfig {
     /// Enable declarative conversation flows (loads from workspace/flows/*.toml)
     #[serde(default)]
     pub flows_enabled: bool,
+    /// Policy constraints for agent-authored flows (Phase 17)
+    #[serde(default)]
+    pub flow_policy: FlowPolicyConfig,
+}
+
+/// Policy constraints for agent-authored flows.
+///
+/// All defaults are secure (authoring disabled, strict limits).
+/// Operators opt-in via `[channels_config.telegram.flow_policy]` in config.toml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowPolicyConfig {
+    /// Master switch: must be true for agent to compose flows (default: false)
+    #[serde(default)]
+    pub agent_authoring_enabled: bool,
+    /// Step kinds the agent is not allowed to use (e.g. ["edit", "poll"])
+    #[serde(default)]
+    pub denied_step_kinds: Vec<String>,
+    /// Maximum number of steps in a single agent-authored flow
+    #[serde(default = "default_max_steps")]
+    pub max_steps: usize,
+    /// Maximum number of distinct agent-authored flows in the DB
+    #[serde(default = "default_max_agent_flows")]
+    pub max_agent_flows: usize,
+    /// Require agent_handoff = true on keyboard steps
+    #[serde(default = "default_true")]
+    pub require_handoff_on_keyboard: bool,
+    /// Auto-approve simple message-only flows (default: false)
+    #[serde(default)]
+    pub auto_approve: bool,
+    /// Max steps for auto-approval eligibility
+    #[serde(default = "default_auto_approve_max_steps")]
+    pub auto_approve_max_steps: usize,
+    /// Denied text patterns (case-insensitive substring match)
+    #[serde(default)]
+    pub denied_text_patterns: Vec<String>,
+}
+
+fn default_max_steps() -> usize {
+    10
+}
+
+fn default_max_agent_flows() -> usize {
+    50
+}
+
+fn default_auto_approve_max_steps() -> usize {
+    5
+}
+
+impl Default for FlowPolicyConfig {
+    fn default() -> Self {
+        Self {
+            agent_authoring_enabled: false,
+            denied_step_kinds: Vec::new(),
+            max_steps: default_max_steps(),
+            max_agent_flows: default_max_agent_flows(),
+            require_handoff_on_keyboard: true,
+            auto_approve: false,
+            auto_approve_max_steps: default_auto_approve_max_steps(),
+            denied_text_patterns: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1184,6 +1246,7 @@ mod tests {
                     allowed_users: vec!["user1".into()],
                     stt_endpoint: None,
                     flows_enabled: false,
+                    flow_policy: FlowPolicyConfig::default(),
                 }),
                 discord: None,
                 slack: None,
@@ -1327,6 +1390,7 @@ default_temperature = 0.7
             allowed_users: vec!["alice".into(), "bob".into()],
             stt_endpoint: None,
             flows_enabled: false,
+            flow_policy: FlowPolicyConfig::default(),
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();

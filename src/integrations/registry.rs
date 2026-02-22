@@ -744,6 +744,7 @@ mod tests {
             allowed_users: vec!["user".into()],
             stt_endpoint: None,
             flows_enabled: false,
+            flow_policy: crate::config::FlowPolicyConfig::default(),
         });
         let entries = all_integrations();
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();
