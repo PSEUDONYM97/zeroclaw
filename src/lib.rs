@@ -22,6 +22,7 @@ pub mod cron;
 pub mod daemon;
 pub mod db;
 pub mod doctor;
+pub mod flows;
 pub mod gateway;
 pub mod health;
 pub mod heartbeat;

@@ -62,6 +62,19 @@ pub struct MessageEvent {
     pub created_at: String,
 }
 
+/// Telegram health counters for a time window.
+#[derive(Debug, Clone)]
+pub struct TelegramHealthCounters {
+    pub events_per_min: f64,
+    pub callback_reject_rate: f64,
+    pub stt_error_rate: f64,
+    pub stt_p95_latency_ms: Option<i64>,
+    pub inbound_count: i64,
+    pub outbound_count: i64,
+    pub auth_reject_count: i64,
+    pub guard_reject_count: i64,
+}
+
 /// Represents an agent lifecycle/task event.
 #[derive(Debug, Clone)]
 pub struct AgentEvent {
@@ -245,7 +258,13 @@ impl Registry {
                 FOREIGN KEY (instance_id) REFERENCES instances(id)
             );
             CREATE INDEX IF NOT EXISTS idx_agent_events_instance_created
-                ON agent_events(instance_id, created_at DESC);",
+                ON agent_events(instance_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_agent_events_channel_created
+                ON agent_events(channel, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_agent_events_type_status
+                ON agent_events(event_type, status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_agent_events_correlation
+                ON agent_events(correlation_id) WHERE correlation_id IS NOT NULL;",
         )?;
 
         // Phase 7.5: agent_usage table
@@ -658,6 +677,261 @@ impl Registry {
             events.push(row?);
         }
         Ok((events, total))
+    }
+
+    // ── Telegram events (Phase 15.5) ────────────────────────────
+
+    /// List Telegram events for an instance with pagination and filtering.
+    /// Wraps list_agent_events with channel='telegram' and optional chat_id filter.
+    pub fn list_telegram_events(
+        &self,
+        instance_id: &str,
+        limit: usize,
+        offset: usize,
+        event_type: Option<&str>,
+        status_filter: Option<&str>,
+        chat_id: Option<&str>,
+        correlation_id: Option<&str>,
+        after: Option<&str>,
+        before: Option<&str>,
+    ) -> Result<(Vec<AgentEvent>, usize)> {
+        let mut where_clauses = vec![
+            "instance_id = ?1".to_string(),
+            "channel = 'telegram'".to_string(),
+        ];
+        let mut param_idx = 2u32;
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(instance_id.to_string())];
+
+        if let Some(et) = event_type {
+            where_clauses.push(format!("event_type = ?{param_idx}"));
+            bind_values.push(Box::new(et.to_string()));
+            param_idx += 1;
+        }
+        if let Some(status) = status_filter {
+            where_clauses.push(format!("status = ?{param_idx}"));
+            bind_values.push(Box::new(status.to_string()));
+            param_idx += 1;
+        }
+        if let Some(cid) = chat_id {
+            where_clauses.push(format!(
+                "(metadata IS NULL OR json_valid(metadata) = 1) AND JSON_EXTRACT(metadata, '$.chat_id') = ?{param_idx}"
+            ));
+            bind_values.push(Box::new(cid.to_string()));
+            param_idx += 1;
+        }
+        if let Some(corr_id) = correlation_id {
+            where_clauses.push(format!("correlation_id = ?{param_idx}"));
+            bind_values.push(Box::new(corr_id.to_string()));
+            param_idx += 1;
+        }
+        if let Some(after_ts) = after {
+            where_clauses.push(format!("created_at > ?{param_idx}"));
+            bind_values.push(Box::new(after_ts.to_string()));
+            param_idx += 1;
+        }
+        if let Some(before_ts) = before {
+            where_clauses.push(format!("created_at < ?{param_idx}"));
+            bind_values.push(Box::new(before_ts.to_string()));
+            param_idx += 1;
+        }
+
+        let where_sql = where_clauses.join(" AND ");
+
+        let count_sql = format!("SELECT COUNT(*) FROM agent_events WHERE {where_sql}");
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let total: usize = self
+            .conn
+            .query_row(&count_sql, params_ref.as_slice(), |row| {
+                row.get::<_, i64>(0).map(|v| v as usize)
+            })?;
+
+        let query_sql = format!(
+            "SELECT id, instance_id, event_type, channel, summary, status, duration_ms, correlation_id, metadata, created_at \
+             FROM agent_events WHERE {where_sql} \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT ?{param_idx} OFFSET ?{}",
+            param_idx + 1
+        );
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = bind_values;
+        all_params.push(Box::new(limit as i64));
+        all_params.push(Box::new(offset as i64));
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&query_sql)?;
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            Ok(AgentEvent {
+                id: row.get(0)?,
+                instance_id: row.get(1)?,
+                event_type: row.get(2)?,
+                channel: row.get(3)?,
+                summary: row.get(4)?,
+                status: row.get(5)?,
+                duration_ms: row.get(6)?,
+                correlation_id: row.get(7)?,
+                metadata: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok((events, total))
+    }
+
+    /// Get a single agent event by ID.
+    pub fn get_agent_event_by_id(&self, event_id: &str) -> Result<Option<AgentEvent>> {
+        self.conn
+            .query_row(
+                "SELECT id, instance_id, event_type, channel, summary, status, duration_ms, correlation_id, metadata, created_at \
+                 FROM agent_events WHERE id = ?1",
+                params![event_id],
+                |row| {
+                    Ok(AgentEvent {
+                        id: row.get(0)?,
+                        instance_id: row.get(1)?,
+                        event_type: row.get(2)?,
+                        channel: row.get(3)?,
+                        summary: row.get(4)?,
+                        status: row.get(5)?,
+                        duration_ms: row.get(6)?,
+                        correlation_id: row.get(7)?,
+                        metadata: row.get(8)?,
+                        created_at: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .context("Failed to query agent event by ID")
+    }
+
+    /// Compute Telegram health counters for an instance within a time window.
+    pub fn telegram_health_counters(
+        &self,
+        instance_id: &str,
+        window_minutes: u64,
+    ) -> Result<TelegramHealthCounters> {
+        let cutoff = format!("datetime('now', '-{window_minutes} minutes')");
+
+        // Total events
+        let total_events: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM agent_events WHERE instance_id = ?1 AND channel = 'telegram' AND created_at >= {cutoff}"
+            ),
+            params![instance_id],
+            |row| row.get(0),
+        )?;
+
+        // Inbound / outbound counts
+        let inbound_count: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM agent_events WHERE instance_id = ?1 AND channel = 'telegram' AND event_type LIKE 'tg.inbound.%' AND created_at >= {cutoff}"
+            ),
+            params![instance_id],
+            |row| row.get(0),
+        )?;
+
+        let outbound_count: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM agent_events WHERE instance_id = ?1 AND channel = 'telegram' AND event_type LIKE 'tg.outbound.%' AND created_at >= {cutoff}"
+            ),
+            params![instance_id],
+            |row| row.get(0),
+        )?;
+
+        // Reject counts
+        let auth_reject_count: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM agent_events WHERE instance_id = ?1 AND channel = 'telegram' AND event_type = 'tg.auth_reject' AND created_at >= {cutoff}"
+            ),
+            params![instance_id],
+            |row| row.get(0),
+        )?;
+
+        let guard_reject_count: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM agent_events WHERE instance_id = ?1 AND channel = 'telegram' AND event_type = 'tg.guard_reject' AND created_at >= {cutoff}"
+            ),
+            params![instance_id],
+            |row| row.get(0),
+        )?;
+
+        // STT error count
+        let stt_error_count: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM agent_events WHERE instance_id = ?1 AND channel = 'telegram' AND event_type = 'tg.stt.error' AND created_at >= {cutoff}"
+            ),
+            params![instance_id],
+            |row| row.get(0),
+        )?;
+
+        // STT total (for error rate)
+        let stt_total: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM agent_events WHERE instance_id = ?1 AND channel = 'telegram' AND event_type LIKE 'tg.stt.%' AND created_at >= {cutoff}"
+            ),
+            params![instance_id],
+            |row| row.get(0),
+        )?;
+
+        // STT latencies for P95 computation
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT duration_ms FROM agent_events WHERE instance_id = ?1 AND channel = 'telegram' AND event_type = 'tg.stt.success' AND duration_ms IS NOT NULL AND created_at >= {cutoff} ORDER BY duration_ms"
+        ))?;
+        let latencies: Vec<i64> = stmt
+            .query_map(params![instance_id], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let stt_p95_latency_ms = if latencies.is_empty() {
+            None
+        } else {
+            let idx = ((latencies.len() as f64) * 0.95).ceil() as usize;
+            let idx = idx.min(latencies.len()) - 1;
+            Some(latencies[idx])
+        };
+
+        // Callback reject count
+        let callback_reject_count: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM agent_events WHERE instance_id = ?1 AND channel = 'telegram' AND event_type = 'tg.auth_reject' AND (metadata IS NULL OR json_valid(metadata) = 1) AND created_at >= {cutoff}"
+            ),
+            params![instance_id],
+            |row| row.get(0),
+        )?;
+
+        let events_per_min = if window_minutes > 0 {
+            total_events as f64 / window_minutes as f64
+        } else {
+            0.0
+        };
+
+        let stt_error_rate = if stt_total > 0 {
+            stt_error_count as f64 / stt_total as f64
+        } else {
+            0.0
+        };
+
+        let callback_reject_rate = if (inbound_count + callback_reject_count) > 0 {
+            callback_reject_count as f64 / (inbound_count + callback_reject_count) as f64
+        } else {
+            0.0
+        };
+
+        Ok(TelegramHealthCounters {
+            events_per_min,
+            callback_reject_rate,
+            stt_error_rate,
+            stt_p95_latency_ms,
+            inbound_count,
+            outbound_count,
+            auth_reject_count,
+            guard_reject_count,
+        })
     }
 
     // ── Agent usage (Phase 7.5) ─────────────────────────────────

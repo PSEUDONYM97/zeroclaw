@@ -9,6 +9,9 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod screenshot;
 pub mod shell;
+pub mod telegram_compose;
+pub mod telegram_flow;
+pub mod telegram_rich;
 pub mod traits;
 
 pub use browser::BrowserTool;
@@ -26,10 +29,12 @@ pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 
+use crate::channels::telegram::TelegramChannel;
+use crate::channels::telegram_types::TelegramToolContext;
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
@@ -105,6 +110,59 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    tools
+}
+
+/// Create Telegram-specific tools for rich messaging.
+pub fn telegram_tools(
+    channel: Arc<TelegramChannel>,
+    context: Arc<Mutex<Option<TelegramToolContext>>>,
+) -> Vec<Box<dyn Tool>> {
+    vec![
+        Box::new(telegram_rich::TelegramKeyboardTool::new(
+            channel.clone(),
+            context.clone(),
+        )),
+        Box::new(telegram_rich::TelegramPollTool::new(
+            channel.clone(),
+            context.clone(),
+        )),
+        Box::new(telegram_rich::TelegramEditTool::new(channel, context)),
+    ]
+}
+
+/// Create Telegram tools including the flow tool (when flows are enabled).
+///
+/// When `flow_db` is provided, the flow tool gains DB fallback for agent-authored flows.
+/// When `flow_policy.agent_authoring_enabled`, the compose tool is also registered.
+pub fn telegram_tools_with_flows(
+    channel: Arc<TelegramChannel>,
+    context: Arc<Mutex<Option<TelegramToolContext>>>,
+    flow_defs: Arc<std::collections::HashMap<String, crate::flows::types::FlowDefinition>>,
+    flow_store: Arc<crate::flows::state::FlowStore>,
+    flow_db: Option<Arc<crate::flows::db::FlowDb>>,
+    flow_policy: crate::config::FlowPolicyConfig,
+) -> Vec<Box<dyn Tool>> {
+    let mut tools = telegram_tools(channel.clone(), context.clone());
+    tools.push(Box::new(telegram_flow::TelegramFlowTool::new(
+        channel,
+        context,
+        flow_defs.clone(),
+        flow_store,
+        flow_db.clone(),
+    )));
+    // Register compose tool only when agent authoring is enabled and DB is available
+    if flow_policy.agent_authoring_enabled {
+        if let Some(db) = flow_db {
+            tools.push(Box::new(
+                telegram_compose::TelegramComposeFlowTool::new(
+                    db,
+                    flow_policy,
+                    flow_defs,
+                ),
+            ));
+        }
+    }
     tools
 }
 

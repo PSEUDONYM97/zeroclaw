@@ -182,6 +182,7 @@ impl Channel for CpRelayChannel {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                metadata: std::collections::HashMap::new(),
             };
 
             tracing::info!(

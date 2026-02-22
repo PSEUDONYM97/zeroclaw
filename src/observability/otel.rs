@@ -24,6 +24,11 @@ pub struct OtelObserver {
     tokens_used: Counter<u64>,
     active_sessions: Gauge<u64>,
     queue_depth: Gauge<u64>,
+    // Phase 15.5: Telegram-specific metrics
+    telegram_events: Counter<u64>,
+    stt_latency: Histogram<f64>,
+    stt_errors: Counter<u64>,
+    callback_rejects: Counter<u64>,
 }
 
 impl OtelObserver {
@@ -136,6 +141,28 @@ impl OtelObserver {
             .with_description("Current message queue depth")
             .build();
 
+        // Phase 15.5: Telegram-specific instruments
+        let telegram_events = meter
+            .u64_counter("zeroclaw.telegram.events")
+            .with_description("Total Telegram events by type")
+            .build();
+
+        let stt_latency = meter
+            .f64_histogram("zeroclaw.telegram.stt.latency")
+            .with_description("STT transcription latency in seconds")
+            .with_unit("s")
+            .build();
+
+        let stt_errors = meter
+            .u64_counter("zeroclaw.telegram.stt.errors")
+            .with_description("Total STT errors")
+            .build();
+
+        let callback_rejects = meter
+            .u64_counter("zeroclaw.telegram.callback.rejects")
+            .with_description("Total rejected callback queries")
+            .build();
+
         Ok(Self {
             tracer_provider,
             meter_provider: meter_provider_clone,
@@ -150,6 +177,10 @@ impl OtelObserver {
             tokens_used,
             active_sessions,
             queue_depth,
+            telegram_events,
+            stt_latency,
+            stt_errors,
+            callback_rejects,
         })
     }
 }
@@ -258,6 +289,45 @@ impl Observer for OtelObserver {
                 self.errors
                     .add(1, &[KeyValue::new("component", component.clone())]);
             }
+            ObserverEvent::TelegramEvent {
+                direction,
+                event_type,
+                status,
+                chat_id,
+                duration,
+                ..
+            } => {
+                let attrs = [
+                    KeyValue::new("direction", direction.clone()),
+                    KeyValue::new("event_type", event_type.clone()),
+                    KeyValue::new("status", status.clone()),
+                ];
+                self.telegram_events.add(1, &attrs);
+
+                if let Some(d) = duration {
+                    let secs = d.as_secs_f64();
+                    let start_time = SystemTime::now()
+                        .checked_sub(*d)
+                        .unwrap_or(SystemTime::now());
+
+                    let mut span = tracer.build(
+                        opentelemetry::trace::SpanBuilder::from_name("telegram.event")
+                            .with_kind(SpanKind::Internal)
+                            .with_start_time(start_time)
+                            .with_attributes(vec![
+                                KeyValue::new("telegram.direction", direction.clone()),
+                                KeyValue::new("telegram.event_type", event_type.clone()),
+                                KeyValue::new("telegram.status", status.clone()),
+                                KeyValue::new("telegram.chat_id", chat_id.clone()),
+                                KeyValue::new("duration_s", secs),
+                            ]),
+                    );
+                    if status == "error" {
+                        span.set_status(Status::error(""));
+                    }
+                    span.end();
+                }
+            }
         }
     }
 
@@ -274,6 +344,19 @@ impl Observer for OtelObserver {
             }
             ObserverMetric::QueueDepth(d) => {
                 self.queue_depth.record(*d as u64, &[]);
+            }
+            ObserverMetric::SttLatency(d) => {
+                self.stt_latency.record(d.as_secs_f64(), &[]);
+            }
+            ObserverMetric::CallbackRejectCount(c) => {
+                self.callback_rejects.add(*c, &[]);
+            }
+            ObserverMetric::SttErrorCount(c) => {
+                self.stt_errors.add(*c, &[]);
+            }
+            ObserverMetric::TelegramEventCount(c) => {
+                self.telegram_events
+                    .add(*c, &[KeyValue::new("source", "metric")]);
             }
         }
     }

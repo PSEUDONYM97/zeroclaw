@@ -7,6 +7,7 @@ pub mod irc;
 pub mod matrix;
 pub mod slack;
 pub mod telegram;
+pub mod telegram_types;
 pub mod traits;
 pub mod whatsapp;
 
@@ -19,6 +20,7 @@ pub use irc::IrcChannel;
 pub use matrix::MatrixChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
+pub use telegram_types::TelegramToolContext;
 pub use traits::Channel;
 pub use whatsapp::WhatsAppChannel;
 
@@ -523,13 +525,107 @@ pub async fn start_channels(config: Config) -> Result<()> {
     } else {
         None
     };
-    let tools_registry = tools::all_tools_with_runtime(
+    let mut tools_registry = tools::all_tools_with_runtime(
         &security,
         runtime_adapter,
         mem.clone(),
         composio_key,
         &config.browser,
     );
+
+    // Shared context for Telegram tools (set before each agent_turn)
+    let telegram_context: Arc<std::sync::Mutex<Option<TelegramToolContext>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    // ── Load flows if enabled ──────────────────────────────────
+    let flows_enabled = config
+        .channels_config
+        .telegram
+        .as_ref()
+        .map_or(false, |tg| tg.flows_enabled);
+
+    let flow_defs: Arc<std::collections::HashMap<String, crate::flows::types::FlowDefinition>> =
+        if flows_enabled {
+            let flows_dir = config.workspace_dir.join("flows");
+            match crate::flows::load_flows(&flows_dir) {
+                Ok(defs) => {
+                    if !defs.is_empty() {
+                        println!("  📋 Flows:    {} loaded", defs.len());
+                    }
+                    Arc::new(defs)
+                }
+                Err(e) => {
+                    anyhow::bail!("Flow validation failed (flows_enabled=true): {e}");
+                }
+            }
+        } else {
+            Arc::new(std::collections::HashMap::new())
+        };
+
+    // Create FlowDb if flows are enabled
+    let flow_db: Option<Arc<crate::flows::db::FlowDb>> = if flows_enabled {
+        let db_path = config.workspace_dir.join("state.db");
+        match crate::flows::db::FlowDb::open(&db_path) {
+            Ok(db) => {
+                tracing::info!("Flow state DB opened: {}", db_path.display());
+                Some(Arc::new(db))
+            }
+            Err(e) => {
+                anyhow::bail!("Failed to open flow state DB: {e}");
+            }
+        }
+    } else {
+        None
+    };
+
+    let flow_store = Arc::new(if let Some(ref db) = flow_db {
+        let store = crate::flows::state::FlowStore::with_db(db.clone());
+        match store.load_from_db() {
+            Ok(n) if n > 0 => {
+                println!("  🔄 Flows:    {n} active flows restored from DB");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Failed to load flows from DB: {e}"),
+        }
+        store
+    } else {
+        crate::flows::state::FlowStore::new()
+    });
+
+    // Conditionally register Telegram tools
+    let telegram_channel_arc: Option<Arc<TelegramChannel>> =
+        if let Some(ref tg) = config.channels_config.telegram {
+            let mut ch = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone());
+            if let Some(ref endpoint) = tg.stt_endpoint {
+                ch = ch.with_stt(endpoint.clone());
+            }
+            ch = ch.with_observer(observer.clone());
+            if let Some(ref db) = flow_db {
+                ch = ch.with_flow_db(db.clone());
+            }
+            let arc = Arc::new(ch);
+            let tg_flow_policy = config
+                .channels_config
+                .telegram
+                .as_ref()
+                .map(|t| t.flow_policy.clone())
+                .unwrap_or_default();
+            if flows_enabled && !flow_defs.is_empty() {
+                tools_registry.extend(tools::telegram_tools_with_flows(
+                    arc.clone(),
+                    telegram_context.clone(),
+                    flow_defs.clone(),
+                    flow_store.clone(),
+                    flow_db.clone(),
+                    tg_flow_policy.clone(),
+                ));
+            } else {
+                tools_registry.extend(tools::telegram_tools(arc.clone(), telegram_context.clone()));
+            }
+            Some(arc)
+        } else {
+            None
+        };
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -566,6 +662,27 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ));
     }
 
+    if config.channels_config.telegram.is_some() {
+        tool_descs.push((
+            "telegram_send_keyboard",
+            "Send a Telegram message with inline keyboard buttons (auto-resolves chat_id from context)",
+        ));
+        tool_descs.push((
+            "telegram_send_poll",
+            "Send a poll to a Telegram chat (auto-resolves chat_id from context)",
+        ));
+        tool_descs.push((
+            "telegram_edit_message",
+            "Edit an existing Telegram message's text and keyboard (auto-resolves chat_id from context)",
+        ));
+        if flows_enabled && !flow_defs.is_empty() {
+            tool_descs.push((
+                "telegram_start_flow",
+                "Start a declarative conversation flow (multi-step interactions with buttons/polls)",
+            ));
+        }
+    }
+
     let mut system_prompt = build_system_prompt(
         &workspace,
         &model,
@@ -591,11 +708,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Collect active channels
     let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
 
-    if let Some(ref tg) = config.channels_config.telegram {
-        channels.push(Arc::new(TelegramChannel::new(
-            tg.bot_token.clone(),
-            tg.allowed_users.clone(),
-        )));
+    if let Some(ref _tg) = config.channels_config.telegram {
+        if let Some(ref tg_arc) = telegram_channel_arc {
+            channels.push(tg_arc.clone());
+        }
     }
 
     if let Some(ref dc) = config.channels_config.discord {
@@ -715,6 +831,132 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
     drop(tx); // Drop our copy so rx closes when all channels stop
 
+    // ── Spawn flow timeout checker (if flows enabled) ───────────
+    // Run when TOML flows exist OR when flow_db is available (agent-authored flows)
+    if flows_enabled && (!flow_defs.is_empty() || flow_db.is_some()) {
+        let timeout_store = flow_store.clone();
+        let timeout_defs = flow_defs.clone();
+        let timeout_tg = telegram_channel_arc.clone();
+        let timeout_flow_db = flow_db.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            // Version-aware cache for agent-authored flows loaded from DB.
+            // Keyed by flow_name -> (version_id, FlowDefinition). Only re-parsed
+            // when the active version changes.
+            let mut db_flow_cache: std::collections::HashMap<
+                String,
+                (i64, crate::flows::types::FlowDefinition),
+            > = std::collections::HashMap::new();
+            loop {
+                interval.tick().await;
+                // Sync cache with DB (picks up CP mutations within 5s)
+                if let Err(e) = timeout_store.refresh_from_db() {
+                    tracing::warn!("Flow store refresh failed: {e}");
+                }
+
+                // Eagerly populate DB cache for active agent-authored flows
+                // so check_timeouts can see them in the merged HashMap.
+                if let Some(ref db) = timeout_flow_db {
+                    let active_names = timeout_store.active_flow_names();
+                    for name in &active_names {
+                        if timeout_defs.contains_key(name) {
+                            continue; // operator TOML flow, skip
+                        }
+                        match db.get_active_version(name) {
+                            Ok(Some(row)) => {
+                                let cached_valid = db_flow_cache
+                                    .get(name)
+                                    .map(|(cid, _)| *cid == row.id)
+                                    .unwrap_or(false);
+                                if !cached_valid {
+                                    if let Ok(toml_def) = serde_json::from_str::<
+                                        crate::flows::types::FlowDefinitionToml,
+                                    >(
+                                        &row.definition_json
+                                    ) {
+                                        if let Ok(def) =
+                                            crate::flows::validate::build_flow_definition(&toml_def)
+                                        {
+                                            db_flow_cache.insert(name.clone(), (row.id, def));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                db_flow_cache.remove(name);
+                            }
+                        }
+                    }
+                }
+
+                // Build merged HashMap: operator TOML defs + cached DB defs
+                let merged_defs = if db_flow_cache.is_empty() {
+                    // Fast path: no agent flows, just use operator defs directly
+                    std::borrow::Cow::Borrowed(timeout_defs.as_ref())
+                } else {
+                    let mut m = timeout_defs.as_ref().clone();
+                    for (name, (_, def)) in &db_flow_cache {
+                        m.entry(name.clone()).or_insert_with(|| def.clone());
+                    }
+                    std::borrow::Cow::Owned(m)
+                };
+
+                let timed_out = timeout_store.check_timeouts(&merged_defs);
+                for (chat_id, flow_name, step_id) in timed_out {
+                    tracing::info!("Flow '{flow_name}' step '{step_id}' timed out for chat {chat_id}");
+
+                    // Resolve flow definition from merged set
+                    let flow_def_resolved = merged_defs.get(&flow_name);
+
+                    if let Some(flow_def) = flow_def_resolved {
+                        if let Some(step) = flow_def.steps.get(&step_id) {
+                            // Look for _timeout transition
+                            let timeout_target = step
+                                .transitions
+                                .iter()
+                                .find(|t| t.on == "_timeout")
+                                .map(|t| t.target.clone());
+
+                            if let Some(target_id) = timeout_target {
+                                if let Some(target_step) = flow_def.steps.get(&target_id) {
+                                    let anchor = timeout_store
+                                        .get_flow_info(&chat_id)
+                                        .and_then(|(_, _, a)| a);
+                                    if let Some(ref tg) = timeout_tg {
+                                        match crate::flows::execute::execute_step(
+                                            tg, &chat_id, target_step, anchor,
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => {
+                                                if target_step.is_terminal() {
+                                                    timeout_store.complete_flow(&chat_id, "timed_out");
+                                                } else {
+                                                    let _ = timeout_store.advance(
+                                                        &chat_id,
+                                                        &target_id,
+                                                        anchor,
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Timeout step execution failed: {e}");
+                                                timeout_store.complete_flow(&chat_id, "timed_out");
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                // No _timeout transition; just complete the flow
+                                timeout_store.complete_flow(&chat_id, "timed_out");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Per-sender conversation histories for multi-turn support
     let mut histories: HashMap<String, Vec<ChatMessage>> = HashMap::new();
 
@@ -738,18 +980,169 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 .await;
         }
 
+        // Set Telegram tool context (so tools can resolve chat_id)
+        if msg.channel == "telegram" {
+            if let Ok(mut guard) = telegram_context.lock() {
+                *guard = Some(TelegramToolContext {
+                    chat_id: msg.sender.clone(),
+                    channel: "telegram".into(),
+                });
+            }
+        }
+
+        // ── Flow pre-processing: callbacks/poll_answers may advance a flow without LLM ──
+        let msg_type_str = msg
+            .metadata
+            .get("msg_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if msg.channel == "telegram"
+            && (msg_type_str == "callback_query" || msg_type_str == "poll_answer")
+            && flows_enabled
+            && flow_store.has_flow(&msg.sender)
+        {
+            let callback_data = msg.content.clone();
+            let chat_id = msg.sender.clone();
+
+            if let Some((flow_name, current_step_id, anchor_msg_id)) =
+                flow_store.get_flow_info(&chat_id)
+            {
+                // Resolve flow definition: operator TOML first, then DB fallback
+                let cb_db_flow_def: Option<crate::flows::types::FlowDefinition>;
+                let cb_flow_def = if let Some(def) = flow_defs.get(&flow_name) {
+                    Some(def)
+                } else if let Some(ref db) = flow_db {
+                    cb_db_flow_def = db.get_active_version(&flow_name).ok().flatten().and_then(|row| {
+                        let toml_def: crate::flows::types::FlowDefinitionToml =
+                            serde_json::from_str(&row.definition_json).ok()?;
+                        crate::flows::validate::build_flow_definition(&toml_def).ok()
+                    });
+                    cb_db_flow_def.as_ref()
+                } else {
+                    None
+                };
+                if let Some(flow_def) = cb_flow_def {
+                    if let Some(current_step) = flow_def.steps.get(&current_step_id) {
+                        // Find matching transition
+                        let matched_transition = current_step
+                            .transitions
+                            .iter()
+                            .find(|t| t.on == callback_data || t.on == "_any");
+
+                        if let Some(transition) = matched_transition {
+                            let target_step_id = transition.target.clone();
+                            if let Some(target_step) = flow_def.steps.get(&target_step_id) {
+                                // Execute the target step
+                                if let Some(ref tg_arc) = telegram_channel_arc {
+                                    match crate::flows::execute::execute_step(
+                                        tg_arc,
+                                        &chat_id,
+                                        target_step,
+                                        anchor_msg_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) => {
+                                            // Store poll_id mapping if present
+                                            if let Some(ref poll_id) = result.poll_id {
+                                                if let Some(ref db) = flow_db {
+                                                    let key = format!("poll:{poll_id}");
+                                                    if let Err(e) = db.set_kv(&key, &chat_id) {
+                                                        tracing::warn!("Failed to store poll_id mapping: {e}");
+                                                    }
+                                                }
+                                            }
+                                            if target_step.is_terminal() {
+                                                flow_store.complete_flow(&chat_id, "completed");
+                                                tracing::info!(
+                                                    "Flow '{flow_name}' completed at terminal step '{target_step_id}'"
+                                                );
+                                            } else {
+                                                let _ = flow_store.advance(
+                                                    &chat_id,
+                                                    &target_step_id,
+                                                    result.anchor_message_id,
+                                                );
+                                            }
+                                            // If agent_handoff, fall through to agent_turn
+                                            if !target_step.agent_handoff {
+                                                continue;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Flow step execution failed: {e}; completing flow"
+                                            );
+                                            flow_store.complete_flow(&chat_id, "completed");
+                                            // Fall through to agent_turn
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                "No matching transition for callback_data '{callback_data}' in flow '{flow_name}' step '{current_step_id}'"
+                            );
+                            // Fall through to agent_turn
+                        }
+                    }
+                }
+            }
+        }
+
         // Get or create conversation history for this sender
         let sender_key = format!("{}:{}", msg.channel, msg.sender);
         let history = histories
             .entry(sender_key)
             .or_insert_with(|| vec![ChatMessage::system(&system_prompt)]);
 
-        // Inject memory context into user message
-        let context = crate::agent::build_context(mem.as_ref(), &msg.content).await;
-        let enriched = if context.is_empty() {
-            msg.content.clone()
+        // Build channel context prefix for the agent
+        let channel_context = if msg.channel == "telegram" {
+            let msg_type = msg
+                .metadata
+                .get("msg_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("text");
+            let reply_suffix = msg
+                .metadata
+                .get("original_message_id")
+                .map(|id| format!(", reply_to_msg_id={id}"))
+                .unwrap_or_default();
+            format!(
+                "[Channel context: telegram, chat_id={}, msg_type={msg_type}{reply_suffix}]\n",
+                msg.sender
+            )
         } else {
-            format!("{context}{}", msg.content)
+            String::new()
+        };
+
+        // Enrich callback queries with human-readable context
+        let user_content = if msg.channel == "telegram"
+            && msg
+                .metadata
+                .get("msg_type")
+                .and_then(|v| v.as_str())
+                == Some("callback_query")
+        {
+            let original_id = msg
+                .metadata
+                .get("original_message_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_default();
+            format!(
+                "[User pressed button: '{}' on message {}]",
+                msg.content, original_id
+            )
+        } else {
+            msg.content.clone()
+        };
+
+        // Inject memory context into user message
+        let context = crate::agent::build_context(mem.as_ref(), &user_content).await;
+        let enriched = if context.is_empty() {
+            format!("{channel_context}{user_content}")
+        } else {
+            format!("{channel_context}{context}{user_content}")
         };
 
         history.push(ChatMessage::user(&enriched));

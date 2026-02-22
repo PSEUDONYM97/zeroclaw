@@ -46,6 +46,7 @@ impl Channel for CliChannel {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                metadata: std::collections::HashMap::new(),
             };
 
             if tx.send(msg).await.is_err() {
@@ -72,6 +73,7 @@ mod tests {
             content: "".into(),
             channel: "cli".into(),
             timestamp: 0,
+            metadata: std::collections::HashMap::new(),
         }
     }
 
@@ -103,6 +105,7 @@ mod tests {
             content: "hello".into(),
             channel: "cli".into(),
             timestamp: 1_234_567_890,
+            metadata: std::collections::HashMap::new(),
         };
         assert_eq!(msg.id, "test-id");
         assert_eq!(msg.sender, "user");
@@ -119,6 +122,7 @@ mod tests {
             content: "c".into(),
             channel: "ch".into(),
             timestamp: 0,
+            metadata: std::collections::HashMap::new(),
         };
         let cloned = msg.clone();
         assert_eq!(cloned.id, msg.id);

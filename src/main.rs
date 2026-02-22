@@ -19,6 +19,7 @@ mod config;
 mod cron;
 mod daemon;
 mod doctor;
+mod flows;
 mod gateway;
 mod health;
 mod heartbeat;

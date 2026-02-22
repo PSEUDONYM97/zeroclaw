@@ -289,6 +289,9 @@ mod tests {
         config.channels_config.telegram = Some(crate::config::TelegramConfig {
             bot_token: "token".into(),
             allowed_users: vec![],
+            stt_endpoint: None,
+            flows_enabled: false,
+            flow_policy: crate::config::FlowPolicyConfig::default(),
         });
         assert!(has_supervised_channels(&config));
     }

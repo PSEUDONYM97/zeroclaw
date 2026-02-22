@@ -1280,6 +1280,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 config.telegram = Some(TelegramConfig {
                     bot_token: token,
                     allowed_users,
+                    stt_endpoint: None,
+                    flows_enabled: false,
+                    flow_policy: crate::config::FlowPolicyConfig::default(),
                 });
             }
             1 => {

@@ -25,6 +25,16 @@ pub enum ObserverEvent {
         component: String,
         message: String,
     },
+    /// Telegram-specific event with full taxonomy
+    TelegramEvent {
+        direction: String,
+        event_type: String,
+        status: String,
+        chat_id: String,
+        correlation_id: String,
+        duration: Option<Duration>,
+        metadata: Option<String>,
+    },
 }
 
 /// Numeric metrics
@@ -34,6 +44,10 @@ pub enum ObserverMetric {
     TokensUsed(u64),
     ActiveSessions(u64),
     QueueDepth(u64),
+    SttLatency(Duration),
+    CallbackRejectCount(u64),
+    SttErrorCount(u64),
+    TelegramEventCount(u64),
 }
 
 /// Core observability trait — implement for any backend

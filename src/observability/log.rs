@@ -40,6 +40,28 @@ impl Observer for LogObserver {
             ObserverEvent::Error { component, message } => {
                 info!(component = %component, error = %message, "error");
             }
+            ObserverEvent::TelegramEvent {
+                direction,
+                event_type,
+                status,
+                chat_id,
+                correlation_id,
+                duration,
+                ..
+            } => {
+                let ms = duration
+                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0);
+                info!(
+                    direction = %direction,
+                    event_type = %event_type,
+                    status = %status,
+                    chat_id = %chat_id,
+                    correlation_id = %correlation_id,
+                    duration_ms = ms,
+                    "telegram.event"
+                );
+            }
         }
     }
 
@@ -57,6 +79,19 @@ impl Observer for LogObserver {
             }
             ObserverMetric::QueueDepth(d) => {
                 info!(depth = d, "metric.queue_depth");
+            }
+            ObserverMetric::SttLatency(d) => {
+                let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+                info!(latency_ms = ms, "metric.stt_latency");
+            }
+            ObserverMetric::CallbackRejectCount(c) => {
+                info!(count = c, "metric.callback_reject_count");
+            }
+            ObserverMetric::SttErrorCount(c) => {
+                info!(count = c, "metric.stt_error_count");
+            }
+            ObserverMetric::TelegramEventCount(c) => {
+                info!(count = c, "metric.telegram_event_count");
             }
         }
     }

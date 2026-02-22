@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::collections::HashMap;
 
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
@@ -8,6 +9,8 @@ pub struct ChannelMessage {
     pub content: String,
     pub channel: String,
     pub timestamp: u64,
+    /// Channel-specific metadata (e.g. msg_type, file_id, callback_query_id)
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 /// Core channel trait — implement for any messaging platform
