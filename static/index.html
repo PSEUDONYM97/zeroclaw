@@ -355,6 +355,7 @@ a:hover { text-decoration: underline; }
   border-radius: var(--radius); color: var(--text-dim); cursor: pointer;
 }
 .subtab.active { border-color: var(--blue); color: var(--blue); }
+.subtab .badge { display: inline-block; background: var(--yellow); color: var(--bg); font-size: 11px; padding: 1px 6px; border-radius: 10px; margin-left: 6px; font-weight: 600; }
 
 /* Inline event detail */
 .event-detail-row td { padding: 0 !important; border-bottom: 1px solid var(--border); }
@@ -376,6 +377,16 @@ a:hover { text-decoration: underline; }
 .status-force-completed::before { background: var(--orange); }
 .status-active { color: var(--blue); }
 .status-active::before { background: var(--blue); }
+.status-draft { color: var(--text-dim); }
+.status-draft::before { background: var(--text-dim); }
+.status-validated { color: var(--green); }
+.status-validated::before { background: var(--green); }
+.status-pending-review { color: var(--yellow); }
+.status-pending-review::before { background: var(--yellow); }
+.status-deactivated { color: var(--text-dim); }
+.status-deactivated::before { background: var(--text-dim); }
+.status-rejected { color: var(--red); }
+.status-rejected::before { background: var(--red); }
 
 /* Clickable rows */
 .data-table tr.clickable { cursor: pointer; }
@@ -441,6 +452,11 @@ function statusClass(s) {
   if (s === 'timed_out') return 'status-timed-out';
   if (s === 'force_completed') return 'status-force-completed';
   if (s === 'active') return 'status-active';
+  if (s === 'draft') return 'status-draft';
+  if (s === 'validated') return 'status-validated';
+  if (s === 'pending_review') return 'status-pending-review';
+  if (s === 'deactivated') return 'status-deactivated';
+  if (s === 'rejected') return 'status-rejected';
   return 'status-unknown';
 }
 
@@ -1741,6 +1757,7 @@ async function renderTelegram(gen) {
 }
 
 // ── Flows tab ────────────────────────────────────────────────────
+var _pendingBadgeCount = 0;
 async function renderFlows(gen) {
   var content = document.getElementById('tab-content');
   clear(content);
@@ -1759,17 +1776,54 @@ async function renderFlows(gen) {
       textContent: 'History',
       onClick: function() { state.flowSubTab = 'history'; renderFlows(gen); }
     }));
+    var reviewBtn = h('button', {
+      className: 'subtab' + (state.flowSubTab === 'review' ? ' active' : ''),
+      onClick: function() { state.flowSubTab = 'review'; renderFlows(gen); }
+    });
+    reviewBtn.appendChild(document.createTextNode('Review Queue'));
+    if (_pendingBadgeCount > 0) {
+      reviewBtn.appendChild(h('span', { className: 'badge', textContent: String(_pendingBadgeCount) }));
+    }
+    subtabBar.appendChild(reviewBtn);
+    subtabBar.appendChild(h('button', {
+      className: 'subtab' + (state.flowSubTab === 'versions' ? ' active' : ''),
+      textContent: 'Versions',
+      onClick: function() { state.flowSubTab = 'versions'; renderFlows(gen); }
+    }));
+    subtabBar.appendChild(h('button', {
+      className: 'subtab' + (state.flowSubTab === 'audit' ? ' active' : ''),
+      textContent: 'Audit Log',
+      onClick: function() { state.flowSubTab = 'audit'; renderFlows(gen); }
+    }));
   }
   buildSubtabs();
   content.appendChild(subtabBar);
+
+  // Fetch pending count for badge (non-blocking)
+  if (state.instance) {
+    api('/instances/' + encodeURIComponent(state.instance) + '/flows/versions/pending').then(function(res) {
+      if (gen !== state.routeGeneration) return;
+      var count = (res.status === 200 && res.data && res.data.total) ? res.data.total : 0;
+      if (count !== _pendingBadgeCount) {
+        _pendingBadgeCount = count;
+        buildSubtabs();
+      }
+    }).catch(function() {});
+  }
 
   var body = h('div', { id: 'flows-body' });
   content.appendChild(body);
 
   if (state.flowSubTab === 'active') {
     await renderActiveFlows(gen, body);
-  } else {
+  } else if (state.flowSubTab === 'history') {
     await renderFlowHistory(gen, body);
+  } else if (state.flowSubTab === 'review') {
+    await renderReviewQueue(gen, body);
+  } else if (state.flowSubTab === 'versions') {
+    await renderFlowVersions(gen, body);
+  } else if (state.flowSubTab === 'audit') {
+    await renderFlowAudit(gen, body);
   }
 }
 
@@ -2062,6 +2116,530 @@ async function renderFlowHistory(gen, container) {
   }
 
   await loadHistory();
+}
+
+// ── Flow definition viewer helper ────────────────────────────────
+function renderFlowDefinitionCard(defJson) {
+  try {
+    var def = (typeof defJson === 'string') ? JSON.parse(defJson) : defJson;
+  } catch (e) {
+    return h('div', { className: 'notify notify-error', textContent: 'Invalid definition JSON' });
+  }
+  var card = h('div', { style: 'background:var(--bg-input);padding:12px;border-radius:var(--radius);margin:8px 0;font-size:12px' });
+
+  var flowInfo = def.flow || {};
+  card.appendChild(h('div', { style: 'margin-bottom:8px' },
+    h('strong', { textContent: flowInfo.name || 'Unnamed' }),
+    flowInfo.description ? h('span', { textContent: ' - ' + flowInfo.description, style: 'color:var(--text-dim)' }) : document.createTextNode('')
+  ));
+  if (flowInfo.start) {
+    card.appendChild(h('div', { textContent: 'Start: ' + flowInfo.start, style: 'color:var(--text-dim);margin-bottom:6px' }));
+  }
+
+  var steps = def.steps || [];
+  if (steps.length === 0) {
+    card.appendChild(h('div', { textContent: 'No steps defined.', style: 'color:var(--text-dim)' }));
+  } else {
+    for (var s of steps) {
+      var trans = (s.transitions || []).map(function(t) { return t.on + ' -> ' + t.target; }).join(', ');
+      var textPreview = (s.text || '').substring(0, 60);
+      if ((s.text || '').length > 60) textPreview += '...';
+      card.appendChild(h('div', { style: 'margin:2px 0;padding:4px;border-left:2px solid var(--border);padding-left:8px' },
+        h('span', { textContent: '[' + (s.kind || '?') + '] ', style: 'color:var(--blue);font-weight:600' }),
+        h('span', { textContent: s.id || '?' }),
+        textPreview ? h('span', { textContent: ' - "' + textPreview + '"', style: 'color:var(--text-dim)' }) : document.createTextNode(''),
+        trans ? h('div', { textContent: 'Transitions: ' + trans, style: 'color:var(--text-dim);font-size:11px;margin-top:2px' }) : document.createTextNode('')
+      ));
+    }
+  }
+  return card;
+}
+
+// ── Review Queue subtab ─────────────────────────────────────────
+async function renderReviewQueue(gen, container) {
+  clear(container);
+  container.appendChild(h('div', { className: 'loading', textContent: 'Loading pending reviews...' }));
+
+  async function loadPending() {
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/versions/pending');
+      if (gen !== state.routeGeneration) return;
+      if (res.status !== 200) {
+        clear(container);
+        container.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) }));
+        return;
+      }
+      paintPending(res.data);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      clear(container);
+      container.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function paintPending(data) {
+    clear(container);
+    var panel = h('div', { className: 'panel' });
+    panel.appendChild(h('div', { className: 'panel-title', textContent: 'Review Queue', style: 'margin-bottom:12px' }));
+
+    var versions = data.versions || [];
+    _pendingBadgeCount = versions.length;
+
+    if (versions.length === 0) {
+      panel.appendChild(h('div', { className: 'empty-state', textContent: 'No versions pending review.' }));
+      container.appendChild(panel);
+      return;
+    }
+
+    var table = h('table', { className: 'data-table' });
+    var thead = h('thead', null,
+      h('tr', null,
+        h('th', { textContent: 'Flow Name' }),
+        h('th', { textContent: 'Version' }),
+        h('th', { textContent: 'Steps' }),
+        h('th', { textContent: 'Created' }),
+        h('th', { textContent: 'Actions' })
+      )
+    );
+    table.appendChild(thead);
+
+    var tbody = h('tbody');
+    for (var i = 0; i < versions.length; i++) {
+      (function(ver) {
+        var stepCount = '-';
+        try {
+          var def = JSON.parse(ver.definition_json);
+          stepCount = (def.steps || []).length;
+        } catch (e) {}
+
+        var detailRow = null;
+        var row = h('tr', { style: 'cursor:pointer', onClick: function() {
+          if (detailRow && detailRow.parentNode) {
+            detailRow.parentNode.removeChild(detailRow);
+            detailRow = null;
+          } else {
+            detailRow = h('tr', { className: 'event-detail-row' },
+              h('td', { colSpan: 5 }, renderFlowDefinitionCard(ver.definition_json))
+            );
+            row.parentNode.insertBefore(detailRow, row.nextSibling);
+          }
+        }},
+          h('td', { textContent: ver.flow_name }),
+          h('td', { textContent: 'v' + ver.version }),
+          h('td', { textContent: String(stepCount) }),
+          h('td', { textContent: fmtTime(ver.created_at) }),
+          h('td', null,
+            h('button', {
+              className: 'btn btn-primary', textContent: 'Approve',
+              style: 'padding:3px 10px;font-size:11px;margin-right:4px',
+              onClick: function(e) {
+                e.stopPropagation();
+                doApprove(ver.flow_name, ver.version, gen);
+              }
+            }),
+            h('button', {
+              className: 'btn btn-danger', textContent: 'Reject',
+              style: 'padding:3px 10px;font-size:11px',
+              onClick: function(e) {
+                e.stopPropagation();
+                showRejectModal(ver.flow_name, ver.version, gen);
+              }
+            })
+          )
+        );
+        tbody.appendChild(row);
+      })(versions[i]);
+    }
+    table.appendChild(tbody);
+    panel.appendChild(table);
+    container.appendChild(panel);
+  }
+
+  function doApprove(flowName, version, gen) {
+    confirmDialog(
+      'Approve Flow Version?',
+      'This will approve and activate "' + flowName + '" v' + version + '. The currently active version (if any) will be deactivated.',
+      'Approve',
+      'btn-primary',
+      async function() {
+        try {
+          var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/versions/' + encodeURIComponent(flowName) + '/' + version + '/approve', { method: 'POST' });
+          if (gen !== state.routeGeneration) return;
+          if (res.status === 200) {
+            showNotify(container, 'success', 'Version approved and activated');
+            loadPending();
+          } else {
+            showNotify(container, 'error', apiErrorMsg(res));
+          }
+        } catch (e) {
+          showNotify(container, 'error', 'Error: ' + e.message);
+        }
+      }
+    );
+  }
+
+  function showRejectModal(flowName, version, gen) {
+    var modal = h('div', { className: 'modal' },
+      h('h3', { textContent: 'Reject Flow Version' }),
+      h('p', { textContent: 'Reject "' + flowName + '" v' + version + '.', style: 'font-size:13px;color:var(--text-dim);margin-bottom:12px' }),
+      h('div', { className: 'form-group' },
+        h('label', { className: 'form-label', textContent: 'Reason (optional)' }),
+        h('textarea', { className: 'form-input', id: 'reject-note-input', rows: 3, placeholder: 'Why is this being rejected?' })
+      ),
+      h('div', { className: 'modal-actions' },
+        h('button', { className: 'btn', textContent: 'Cancel', onClick: closeModal }),
+        h('button', { className: 'btn btn-danger', textContent: 'Reject', onClick: async function() {
+          var noteInput = document.getElementById('reject-note-input');
+          var note = noteInput ? noteInput.value.trim() : '';
+          closeModal();
+          try {
+            var body = {};
+            if (note) body.note = note;
+            var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/versions/' + encodeURIComponent(flowName) + '/' + version + '/reject', {
+              method: 'POST', body: body
+            });
+            if (gen !== state.routeGeneration) return;
+            if (res.status === 200) {
+              showNotify(container, 'success', 'Version rejected');
+              loadPending();
+            } else {
+              showNotify(container, 'error', apiErrorMsg(res));
+            }
+          } catch (e) {
+            showNotify(container, 'error', 'Error: ' + e.message);
+          }
+        }})
+      )
+    );
+    showModal(modal);
+  }
+
+  await loadPending();
+
+  // Auto-refresh: 10s
+  state.refreshTimer = setInterval(function() {
+    if (gen !== state.routeGeneration) return;
+    loadPending();
+  }, 10000);
+}
+
+// ── Versions subtab ─────────────────────────────────────────────
+async function renderFlowVersions(gen, container) {
+  clear(container);
+
+  var verFilterName = '';
+  var verFilterStatus = '';
+  var verFilterSource = '';
+  var verOffset = 0;
+  var verLimit = 20;
+
+  function buildVersionsFilter() {
+    var bar = h('div', { className: 'filter-bar' });
+    bar.appendChild(h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Flow Name' }),
+      h('input', { type: 'text', value: verFilterName, placeholder: 'Flow name', onInput: function(e) { verFilterName = e.target.value; } })
+    ));
+    var statusSelect = h('select');
+    var statusOpts = [
+      { value: '', label: 'All' },
+      { value: 'draft', label: 'Draft' },
+      { value: 'validated', label: 'Validated' },
+      { value: 'pending_review', label: 'Pending Review' },
+      { value: 'active', label: 'Active' },
+      { value: 'deactivated', label: 'Deactivated' },
+      { value: 'rejected', label: 'Rejected' },
+    ];
+    for (var o of statusOpts) {
+      var opt = h('option', { value: o.value, textContent: o.label });
+      if (o.value === verFilterStatus) opt.selected = true;
+      statusSelect.appendChild(opt);
+    }
+    statusSelect.addEventListener('change', function(e) { verFilterStatus = e.target.value; });
+    bar.appendChild(h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Status' }),
+      statusSelect
+    ));
+    var sourceSelect = h('select');
+    var sourceOpts = [
+      { value: '', label: 'All' },
+      { value: 'agent', label: 'Agent' },
+      { value: 'operator', label: 'Operator' },
+    ];
+    for (var o of sourceOpts) {
+      var opt = h('option', { value: o.value, textContent: o.label });
+      if (o.value === verFilterSource) opt.selected = true;
+      sourceSelect.appendChild(opt);
+    }
+    sourceSelect.addEventListener('change', function(e) { verFilterSource = e.target.value; });
+    bar.appendChild(h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Source' }),
+      sourceSelect
+    ));
+    bar.appendChild(h('button', { className: 'btn btn-primary', textContent: 'Apply', onClick: function() { verOffset = 0; loadVersions(); } }));
+    bar.appendChild(h('button', { className: 'btn', textContent: 'Clear', onClick: function() {
+      verFilterName = ''; verFilterStatus = ''; verFilterSource = '';
+      verOffset = 0; loadVersions();
+    }}));
+    return bar;
+  }
+
+  container.appendChild(buildVersionsFilter());
+  var verBody = h('div', { id: 'flow-versions-body' });
+  container.appendChild(verBody);
+
+  async function loadVersions() {
+    var body = document.getElementById('flow-versions-body');
+    if (!body) return;
+    clear(body);
+    body.appendChild(h('div', { className: 'loading', textContent: 'Loading flow versions...' }));
+
+    var params = 'limit=' + verLimit + '&offset=' + verOffset;
+    if (verFilterName) params += '&flow_name=' + encodeURIComponent(verFilterName);
+    if (verFilterStatus) params += '&status=' + encodeURIComponent(verFilterStatus);
+    if (verFilterSource) params += '&source=' + encodeURIComponent(verFilterSource);
+
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/versions?' + params);
+      if (gen !== state.routeGeneration) return;
+      if (res.status !== 200) {
+        clear(body);
+        body.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) }));
+        return;
+      }
+      paintVersions(res.data, body);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      clear(body);
+      body.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function paintVersions(data, body) {
+    clear(body);
+    var panel = h('div', { className: 'panel' });
+    panel.appendChild(h('div', { className: 'panel-title', textContent: 'Flow Versions', style: 'margin-bottom:12px' }));
+
+    var versions = data.versions || [];
+    if (versions.length === 0) {
+      panel.appendChild(h('div', { className: 'empty-state', textContent: 'No flow versions found.' }));
+      body.appendChild(panel);
+      return;
+    }
+
+    var table = h('table', { className: 'data-table' });
+    var thead = h('thead', null,
+      h('tr', null,
+        h('th', { textContent: 'Flow Name' }),
+        h('th', { textContent: 'Version' }),
+        h('th', { textContent: 'Source' }),
+        h('th', { textContent: 'Status' }),
+        h('th', { textContent: 'Created' }),
+        h('th', { textContent: 'Created By' }),
+        h('th', { textContent: 'Actions' })
+      )
+    );
+    table.appendChild(thead);
+
+    var tbody = h('tbody');
+    for (var i = 0; i < versions.length; i++) {
+      (function(ver) {
+        var canActivate = (ver.status === 'deactivated' || ver.status === 'validated' || ver.status === 'pending_review');
+        var detailRow = null;
+
+        var actionsCell = h('td');
+        if (canActivate) {
+          actionsCell.appendChild(h('button', {
+            className: 'btn btn-primary', textContent: 'Activate',
+            style: 'padding:3px 10px;font-size:11px;margin-right:4px',
+            onClick: function(e) {
+              e.stopPropagation();
+              doActivate(ver.flow_name, ver.version, gen);
+            }
+          }));
+        }
+        actionsCell.appendChild(h('button', {
+          className: 'btn', textContent: 'View',
+          style: 'padding:3px 10px;font-size:11px',
+          onClick: function(e) {
+            e.stopPropagation();
+            if (detailRow && detailRow.parentNode) {
+              detailRow.parentNode.removeChild(detailRow);
+              detailRow = null;
+            } else {
+              detailRow = h('tr', { className: 'event-detail-row' },
+                h('td', { colSpan: 7 }, renderFlowDefinitionCard(ver.definition_json))
+              );
+              row.parentNode.insertBefore(detailRow, row.nextSibling);
+            }
+          }
+        }));
+
+        var row = h('tr', null,
+          h('td', { textContent: ver.flow_name }),
+          h('td', { textContent: 'v' + ver.version }),
+          h('td', { textContent: ver.source || '-' }),
+          h('td', null, h('span', { className: 'status ' + statusClass(ver.status || 'unknown'), textContent: ver.status || '-' })),
+          h('td', { textContent: fmtTime(ver.created_at) }),
+          h('td', { textContent: ver.created_by || '-' }),
+          actionsCell
+        );
+        tbody.appendChild(row);
+      })(versions[i]);
+    }
+    table.appendChild(tbody);
+    panel.appendChild(table);
+
+    // Pagination
+    var total = data.total || 0;
+    if (total > 0) {
+      var pag = h('div', { className: 'pagination' },
+        h('span', { textContent: 'Showing ' + (verOffset + 1) + '-' + Math.min(verOffset + versions.length, total) + ' of ' + total })
+      );
+      if (verOffset > 0) {
+        pag.appendChild(h('button', { className: 'btn', textContent: 'Previous', onClick: function() { verOffset = Math.max(0, verOffset - verLimit); loadVersions(); } }));
+      }
+      if (verOffset + verLimit < total) {
+        pag.appendChild(h('button', { className: 'btn', textContent: 'Next', onClick: function() { verOffset += verLimit; loadVersions(); } }));
+      }
+      panel.appendChild(pag);
+    }
+    body.appendChild(panel);
+  }
+
+  function doActivate(flowName, version, gen) {
+    confirmDialog(
+      'Activate Flow Version?',
+      'This will activate "' + flowName + '" v' + version + '. The currently active version (if any) will be deactivated.',
+      'Activate',
+      'btn-primary',
+      async function() {
+        try {
+          var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/versions/' + encodeURIComponent(flowName) + '/' + version + '/activate', { method: 'POST' });
+          if (gen !== state.routeGeneration) return;
+          if (res.status === 200) {
+            showNotify(container, 'success', 'Version activated');
+            loadVersions();
+          } else {
+            showNotify(container, 'error', apiErrorMsg(res));
+          }
+        } catch (e) {
+          showNotify(container, 'error', 'Error: ' + e.message);
+        }
+      }
+    );
+  }
+
+  await loadVersions();
+}
+
+// ── Audit Log subtab ────────────────────────────────────────────
+async function renderFlowAudit(gen, container) {
+  clear(container);
+
+  var auditFilterName = '';
+  var auditOffset = 0;
+  var auditLimit = 20;
+
+  function buildAuditFilter() {
+    var bar = h('div', { className: 'filter-bar' });
+    bar.appendChild(h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Flow Name' }),
+      h('input', { type: 'text', value: auditFilterName, placeholder: 'Flow name', onInput: function(e) { auditFilterName = e.target.value; } })
+    ));
+    bar.appendChild(h('button', { className: 'btn btn-primary', textContent: 'Apply', onClick: function() { auditOffset = 0; loadAudit(); } }));
+    bar.appendChild(h('button', { className: 'btn', textContent: 'Clear', onClick: function() {
+      auditFilterName = '';
+      auditOffset = 0; loadAudit();
+    }}));
+    return bar;
+  }
+
+  container.appendChild(buildAuditFilter());
+  var auditBody = h('div', { id: 'flow-audit-body' });
+  container.appendChild(auditBody);
+
+  async function loadAudit() {
+    var body = document.getElementById('flow-audit-body');
+    if (!body) return;
+    clear(body);
+    body.appendChild(h('div', { className: 'loading', textContent: 'Loading audit log...' }));
+
+    var params = 'limit=' + auditLimit + '&offset=' + auditOffset;
+    if (auditFilterName) params += '&flow_name=' + encodeURIComponent(auditFilterName);
+
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/audit?' + params);
+      if (gen !== state.routeGeneration) return;
+      if (res.status !== 200) {
+        clear(body);
+        body.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) }));
+        return;
+      }
+      paintAudit(res.data, body);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      clear(body);
+      body.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function paintAudit(data, body) {
+    clear(body);
+    var panel = h('div', { className: 'panel' });
+    panel.appendChild(h('div', { className: 'panel-title', textContent: 'Flow Audit Log', style: 'margin-bottom:12px' }));
+
+    var entries = data.entries || [];
+    if (entries.length === 0) {
+      panel.appendChild(h('div', { className: 'empty-state', textContent: 'No audit log entries found.' }));
+      body.appendChild(panel);
+      return;
+    }
+
+    var table = h('table', { className: 'data-table' });
+    var thead = h('thead', null,
+      h('tr', null,
+        h('th', { textContent: 'Time' }),
+        h('th', { textContent: 'Flow' }),
+        h('th', { textContent: 'Version' }),
+        h('th', { textContent: 'Event' }),
+        h('th', { textContent: 'Actor' }),
+        h('th', { textContent: 'Detail' })
+      )
+    );
+    table.appendChild(thead);
+
+    var tbody = h('tbody');
+    for (var r of entries) {
+      tbody.appendChild(h('tr', null,
+        h('td', { textContent: fmtTime(r.created_at) }),
+        h('td', { textContent: r.flow_name || '-' }),
+        h('td', { textContent: r.version != null ? 'v' + r.version : '-' }),
+        h('td', { textContent: r.event || '-' }),
+        h('td', { textContent: r.actor || '-' }),
+        h('td', { textContent: r.detail || '-', style: 'max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' })
+      ));
+    }
+    table.appendChild(tbody);
+    panel.appendChild(table);
+
+    // Pagination
+    var total = data.total || 0;
+    if (total > 0) {
+      var pag = h('div', { className: 'pagination' },
+        h('span', { textContent: 'Showing ' + (auditOffset + 1) + '-' + Math.min(auditOffset + entries.length, total) + ' of ' + total })
+      );
+      if (auditOffset > 0) {
+        pag.appendChild(h('button', { className: 'btn', textContent: 'Previous', onClick: function() { auditOffset = Math.max(0, auditOffset - auditLimit); loadAudit(); } }));
+      }
+      if (auditOffset + auditLimit < total) {
+        pag.appendChild(h('button', { className: 'btn', textContent: 'Next', onClick: function() { auditOffset += auditLimit; loadAudit(); } }));
+      }
+      panel.appendChild(pag);
+    }
+    body.appendChild(panel);
+  }
+
+  await loadAudit();
 }
 
 // ── Usage tab ────────────────────────────────────────────────────

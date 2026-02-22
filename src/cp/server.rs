@@ -169,6 +169,35 @@ pub fn build_router(state: CpState) -> Router {
             "/instances/:name/flows/active/:chat_id/replay",
             post(handle_flow_replay),
         )
+        // Phase 17.5: Flow version management endpoints
+        .route(
+            "/instances/:name/flows/versions/pending",
+            get(handle_flow_versions_pending),
+        )
+        .route(
+            "/instances/:name/flows/versions",
+            get(handle_flow_versions_list),
+        )
+        .route(
+            "/instances/:name/flows/versions/:flow_name/:version",
+            get(handle_flow_version_detail),
+        )
+        .route(
+            "/instances/:name/flows/versions/:flow_name/:version/approve",
+            post(handle_flow_version_approve),
+        )
+        .route(
+            "/instances/:name/flows/versions/:flow_name/:version/reject",
+            post(handle_flow_version_reject),
+        )
+        .route(
+            "/instances/:name/flows/versions/:flow_name/:version/activate",
+            post(handle_flow_version_activate),
+        )
+        .route(
+            "/instances/:name/flows/audit",
+            get(handle_flow_audit),
+        )
         // Phase 15.5: Telegram observability endpoints
         .route(
             "/instances/:name/telegram/events",
@@ -2865,6 +2894,694 @@ async fn handle_flow_replay(
             Err(e) => {
                 tracing::error!("Failed to replay flow: {e:#}");
                 err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to replay flow")
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── Phase 17.5: Flow Version Management API ─────────────────────
+
+#[derive(Deserialize)]
+struct FlowVersionsQuery {
+    flow_name: Option<String>,
+    status: Option<String>,
+    source: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct FlowAuditQuery {
+    flow_name: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct FlowVersionRejectBody {
+    note: Option<String>,
+}
+
+/// GET /api/instances/:name/flows/versions/pending
+async fn handle_flow_versions_pending(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        let state_db_path = match resolve_state_db(&instance) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        if !state_db_path.exists() {
+            return ok_json(serde_json::json!({ "versions": [], "total": 0 }));
+        }
+
+        let flow_db = match crate::flows::db::FlowDb::open_read_only(&state_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("Failed to open state.db: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open flow state DB");
+            }
+        };
+
+        match flow_db.list_pending_review() {
+            Ok(rows) => {
+                let total = rows.len();
+                let versions: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "flow_name": r.flow_name,
+                            "version": r.version,
+                            "source": r.source,
+                            "status": r.status,
+                            "definition_json": r.definition_json,
+                            "created_at": r.created_at,
+                            "created_by": r.created_by,
+                            "review_note": r.review_note,
+                        })
+                    })
+                    .collect();
+                ok_json(serde_json::json!({ "versions": versions, "total": total }))
+            }
+            Err(e) => {
+                tracing::error!("Failed to list pending flow versions: {e:#}");
+                err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to list pending flow versions")
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+/// GET /api/instances/:name/flows/versions
+async fn handle_flow_versions_list(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+    Query(params): Query<FlowVersionsQuery>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+    let limit = params.limit.unwrap_or(50).min(200);
+    let offset = params.offset.unwrap_or(0);
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        let state_db_path = match resolve_state_db(&instance) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        if !state_db_path.exists() {
+            return ok_json(serde_json::json!({
+                "versions": [],
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+            }));
+        }
+
+        let flow_db = match crate::flows::db::FlowDb::open_read_only(&state_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("Failed to open state.db: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open flow state DB");
+            }
+        };
+
+        match flow_db.list_all_flow_versions(
+            limit,
+            offset,
+            params.flow_name.as_deref(),
+            params.status.as_deref(),
+            params.source.as_deref(),
+        ) {
+            Ok((rows, total)) => {
+                let versions: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "flow_name": r.flow_name,
+                            "version": r.version,
+                            "source": r.source,
+                            "status": r.status,
+                            "definition_json": r.definition_json,
+                            "created_at": r.created_at,
+                            "created_by": r.created_by,
+                            "review_note": r.review_note,
+                        })
+                    })
+                    .collect();
+                ok_json(serde_json::json!({
+                    "versions": versions,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                }))
+            }
+            Err(e) => {
+                tracing::error!("Failed to list flow versions: {e:#}");
+                err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to list flow versions")
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+/// GET /api/instances/:name/flows/versions/:flow_name/:version
+async fn handle_flow_version_detail(
+    State(state): State<CpState>,
+    AxumPath((name, flow_name, version)): AxumPath<(String, String, i64)>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        let state_db_path = match resolve_state_db(&instance) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        if !state_db_path.exists() {
+            return err_json(StatusCode::NOT_FOUND, "No flow state DB found");
+        }
+
+        let flow_db = match crate::flows::db::FlowDb::open_read_only(&state_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("Failed to open state.db: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open flow state DB");
+            }
+        };
+
+        match flow_db.get_flow_version(&flow_name, version) {
+            Ok(Some(r)) => ok_json(serde_json::json!({
+                "id": r.id,
+                "flow_name": r.flow_name,
+                "version": r.version,
+                "source": r.source,
+                "status": r.status,
+                "definition_json": r.definition_json,
+                "created_at": r.created_at,
+                "created_by": r.created_by,
+                "review_note": r.review_note,
+            })),
+            Ok(None) => err_json(
+                StatusCode::NOT_FOUND,
+                &format!("Flow version {flow_name} v{version} not found"),
+            ),
+            Err(e) => {
+                tracing::error!("Failed to get flow version: {e:#}");
+                err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get flow version")
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+/// POST /api/instances/:name/flows/versions/:flow_name/:version/approve
+async fn handle_flow_version_approve(
+    State(state): State<CpState>,
+    AxumPath((name, flow_name, version)): AxumPath<(String, String, i64)>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        let state_db_path = match resolve_state_db(&instance) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        if !state_db_path.exists() {
+            return err_json(StatusCode::NOT_FOUND, "No flow state DB found");
+        }
+
+        let flow_db = match crate::flows::db::FlowDb::open(&state_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("Failed to open state.db: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open flow state DB");
+            }
+        };
+
+        // Validate that the version exists and is pending_review
+        let row = match flow_db.get_flow_version(&flow_name, version) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("Flow version {flow_name} v{version} not found"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to get flow version: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get flow version");
+            }
+        };
+
+        if row.status != "pending_review" {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Cannot approve: version status is '{}', expected 'pending_review'",
+                    row.status
+                ),
+            );
+        }
+
+        // Activate (deactivates previous active version)
+        if let Err(e) = flow_db.activate_version(&flow_name, version) {
+            tracing::error!("Failed to activate flow version: {e:#}");
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to activate flow version");
+        }
+
+        // Audit: approved + activated
+        if let Err(e) = flow_db.log_audit(&flow_name, Some(version), "approved", "operator", None) {
+            tracing::error!("Failed to write audit log for approve: {e:#}");
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to write audit log");
+        }
+        if let Err(e) = flow_db.log_audit(&flow_name, Some(version), "activated", "operator", None) {
+            tracing::error!("Failed to write audit log for activate: {e:#}");
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to write audit log");
+        }
+
+        ok_json(serde_json::json!({
+            "status": "approved",
+            "flow_name": flow_name,
+            "version": version,
+        }))
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+/// POST /api/instances/:name/flows/versions/:flow_name/:version/reject
+async fn handle_flow_version_reject(
+    State(state): State<CpState>,
+    AxumPath((name, flow_name, version)): AxumPath<(String, String, i64)>,
+    Json(body): Json<FlowVersionRejectBody>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        let state_db_path = match resolve_state_db(&instance) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        if !state_db_path.exists() {
+            return err_json(StatusCode::NOT_FOUND, "No flow state DB found");
+        }
+
+        let flow_db = match crate::flows::db::FlowDb::open(&state_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("Failed to open state.db: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open flow state DB");
+            }
+        };
+
+        // Validate that the version exists and is pending_review
+        let row = match flow_db.get_flow_version(&flow_name, version) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("Flow version {flow_name} v{version} not found"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to get flow version: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get flow version");
+            }
+        };
+
+        if row.status != "pending_review" {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Cannot reject: version status is '{}', expected 'pending_review'",
+                    row.status
+                ),
+            );
+        }
+
+        // Update status to rejected with optional note
+        match flow_db.update_version_status(
+            &flow_name,
+            version,
+            "rejected",
+            body.note.as_deref(),
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("Flow version {flow_name} v{version} not found"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to reject flow version: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to reject flow version");
+            }
+        }
+
+        // Audit: rejected
+        let detail = body.note.as_deref();
+        if let Err(e) = flow_db.log_audit(&flow_name, Some(version), "rejected", "operator", detail) {
+            tracing::error!("Failed to write audit log for reject: {e:#}");
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to write audit log");
+        }
+
+        ok_json(serde_json::json!({
+            "status": "rejected",
+            "flow_name": flow_name,
+            "version": version,
+        }))
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+/// POST /api/instances/:name/flows/versions/:flow_name/:version/activate
+async fn handle_flow_version_activate(
+    State(state): State<CpState>,
+    AxumPath((name, flow_name, version)): AxumPath<(String, String, i64)>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        let state_db_path = match resolve_state_db(&instance) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        if !state_db_path.exists() {
+            return err_json(StatusCode::NOT_FOUND, "No flow state DB found");
+        }
+
+        let flow_db = match crate::flows::db::FlowDb::open(&state_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("Failed to open state.db: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open flow state DB");
+            }
+        };
+
+        // Validate that the version exists and is not draft or rejected
+        let row = match flow_db.get_flow_version(&flow_name, version) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("Flow version {flow_name} v{version} not found"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to get flow version: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get flow version");
+            }
+        };
+
+        if row.status == "draft" || row.status == "rejected" {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Cannot activate: version status is '{}'; only validated, active, deactivated, or pending_review versions can be activated",
+                    row.status
+                ),
+            );
+        }
+
+        // Activate (deactivates previous active version)
+        if let Err(e) = flow_db.activate_version(&flow_name, version) {
+            tracing::error!("Failed to activate flow version: {e:#}");
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to activate flow version");
+        }
+
+        // Audit: activated
+        if let Err(e) = flow_db.log_audit(&flow_name, Some(version), "activated", "operator", None) {
+            tracing::error!("Failed to write audit log for activate: {e:#}");
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to write audit log");
+        }
+
+        ok_json(serde_json::json!({
+            "status": "activated",
+            "flow_name": flow_name,
+            "version": version,
+        }))
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+/// GET /api/instances/:name/flows/audit
+async fn handle_flow_audit(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+    Query(params): Query<FlowAuditQuery>,
+) -> ApiResponse {
+    let db_path = state.db_path.clone();
+    let limit = params.limit.unwrap_or(50).min(200);
+    let offset = params.offset.unwrap_or(0);
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to query instance");
+            }
+        };
+
+        let state_db_path = match resolve_state_db(&instance) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        if !state_db_path.exists() {
+            return ok_json(serde_json::json!({
+                "entries": [],
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+            }));
+        }
+
+        let flow_db = match crate::flows::db::FlowDb::open_read_only(&state_db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("Failed to open state.db: {e:#}");
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to open flow state DB");
+            }
+        };
+
+        match flow_db.list_audit_log(limit, offset, params.flow_name.as_deref()) {
+            Ok((rows, total)) => {
+                let entries: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "flow_name": r.flow_name,
+                            "version": r.version,
+                            "event": r.event,
+                            "actor": r.actor,
+                            "detail": r.detail,
+                            "created_at": r.created_at,
+                        })
+                    })
+                    .collect();
+                ok_json(serde_json::json!({
+                    "entries": entries,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                }))
+            }
+            Err(e) => {
+                tracing::error!("Failed to list flow audit log: {e:#}");
+                err_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to list flow audit log")
             }
         }
     })
