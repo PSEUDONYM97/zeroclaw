@@ -330,6 +330,56 @@ a:hover { text-decoration: underline; }
   font-size: 13px; color: var(--text-dim); cursor: pointer;
 }
 .toggle-label input { cursor: pointer; }
+
+/* Filter bar */
+.filter-bar {
+  display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 12px;
+  margin-bottom: 16px;
+}
+.filter-field { display: flex; flex-direction: column; gap: 2px; }
+.filter-field label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+.filter-field input,
+.filter-field select {
+  padding: 6px 10px; background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); font-family: var(--mono); font-size: 12px;
+}
+.filter-field input:focus, .filter-field select:focus { outline: none; border-color: var(--blue); }
+
+/* Subtab toggle */
+.subtab-bar { display: flex; gap: 4px; margin-bottom: 16px; }
+.subtab {
+  padding: 6px 16px; font-size: 13px; font-family: var(--font);
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text-dim); cursor: pointer;
+}
+.subtab.active { border-color: var(--blue); color: var(--blue); }
+
+/* Inline event detail */
+.event-detail-row td { padding: 0 !important; border-bottom: 1px solid var(--border); }
+.event-detail-content {
+  padding: 16px 20px; background: var(--bg);
+  border-top: 1px solid var(--border);
+}
+.event-detail-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+/* Flow status badges */
+.status-completed { color: var(--green); }
+.status-completed::before { background: var(--green); }
+.status-timed-out { color: var(--yellow); }
+.status-timed-out::before { background: var(--yellow); }
+.status-force-completed { color: var(--orange); }
+.status-force-completed::before { background: var(--orange); }
+.status-active { color: var(--blue); }
+.status-active::before { background: var(--blue); }
+
+/* Clickable rows */
+.data-table tr.clickable { cursor: pointer; }
+.data-table tr.clickable:hover td { background: rgba(97,175,239,0.05); }
 </style>
 </head>
 <body>
@@ -355,6 +405,8 @@ const state = {
   configEtag: null,
   routeGeneration: 0,
   showArchived: false,
+  expandedEventId: null,
+  flowSubTab: 'active',
 };
 
 // ── DOM helpers (XSS-safe) ───────────────────────────────────────
@@ -385,6 +437,10 @@ function statusClass(s) {
   if (s === 'stale-pid') return 'status-stale-pid';
   if (s === 'dead') return 'status-dead';
   if (s === 'archived') return 'status-archived';
+  if (s === 'completed') return 'status-completed';
+  if (s === 'timed_out') return 'status-timed-out';
+  if (s === 'force_completed') return 'status-force-completed';
+  if (s === 'active') return 'status-active';
   return 'status-unknown';
 }
 
@@ -845,7 +901,7 @@ function renderInstance(gen) {
   app.appendChild(header);
 
   // Tabs
-  var tabs = ['overview', 'logs', 'config', 'events', 'usage'];
+  var tabs = ['overview', 'logs', 'config', 'events', 'telegram', 'flows', 'usage'];
   var tabBar = h('div', { className: 'tabs' });
   for (var i = 0; i < tabs.length; i++) {
     (function(t) {
@@ -868,6 +924,8 @@ function renderInstance(gen) {
   else if (state.tab === 'logs') renderLogs(gen);
   else if (state.tab === 'config') renderConfig(gen);
   else if (state.tab === 'events') renderEvents(gen);
+  else if (state.tab === 'telegram') renderTelegram(gen);
+  else if (state.tab === 'flows') renderFlows(gen);
   else if (state.tab === 'usage') renderUsage(gen);
 }
 
@@ -1347,6 +1405,663 @@ async function renderEvents(gen) {
   }
 
   await load();
+}
+
+// ── Telegram tab ─────────────────────────────────────────────────
+async function renderTelegram(gen) {
+  var content = document.getElementById('tab-content');
+  clear(content);
+
+  // Health section
+  var healthPanel = h('div', { className: 'panel', style: 'margin-bottom:20px' });
+  var healthHeader = h('div', { className: 'panel-header' },
+    h('div', { className: 'panel-title', textContent: 'Telegram Health' })
+  );
+  healthPanel.appendChild(healthHeader);
+
+  var currentHealthWindow = '5m';
+
+  function buildWindowSelector(parent) {
+    var existing = parent.querySelector('.window-select');
+    if (existing) existing.remove();
+    var selector = h('div', { className: 'window-select', style: 'margin-bottom:12px' });
+    var windows = ['1m', '5m', '15m', '1h'];
+    for (var i = 0; i < windows.length; i++) {
+      (function(w) {
+        selector.appendChild(h('button', {
+          className: 'window-btn' + (w === currentHealthWindow ? ' active' : ''),
+          textContent: w,
+          onClick: function() { currentHealthWindow = w; loadHealth(); }
+        }));
+      })(windows[i]);
+    }
+    parent.insertBefore(selector, healthHeader.nextSibling);
+  }
+
+  var healthGrid = h('div', { className: 'usage-grid', id: 'tg-health-grid' });
+  healthPanel.appendChild(healthGrid);
+  content.appendChild(healthPanel);
+
+  async function loadHealth() {
+    buildWindowSelector(healthPanel);
+    var grid = document.getElementById('tg-health-grid');
+    if (!grid) return;
+    clear(grid);
+    grid.appendChild(h('div', { className: 'loading', textContent: 'Loading health...' }));
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/telegram/health?window=' + currentHealthWindow);
+      if (gen !== state.routeGeneration) return;
+      if (res.status !== 200) {
+        clear(grid);
+        grid.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) }));
+        return;
+      }
+      paintHealth(res.data, grid);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      clear(grid);
+      grid.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function paintHealth(data, grid) {
+    clear(grid);
+    var c = data.counters || {};
+    var stats = [
+      { label: 'Events/min', value: c.events_per_min != null ? c.events_per_min.toFixed(1) : '0' },
+      { label: 'Inbound', value: fmtNum(c.inbound_count) },
+      { label: 'Outbound', value: fmtNum(c.outbound_count) },
+      { label: 'Auth Rejects', value: fmtNum(c.auth_reject_count) },
+      { label: 'Guard Rejects', value: fmtNum(c.guard_reject_count) },
+      { label: 'Callback Reject %', value: c.callback_reject_rate != null ? c.callback_reject_rate.toFixed(1) + '%' : '-' },
+      { label: 'STT Error %', value: c.stt_error_rate != null ? c.stt_error_rate.toFixed(1) + '%' : '-' },
+      { label: 'STT P95 Latency', value: fmtDuration(c.stt_p95_latency_ms) },
+    ];
+    for (var s of stats) {
+      grid.appendChild(h('div', { className: 'usage-stat' },
+        h('div', { className: 'usage-stat-label', textContent: s.label }),
+        h('div', { className: 'usage-stat-value', textContent: s.value })
+      ));
+    }
+  }
+
+  // Health auto-refresh: 15s
+  await loadHealth();
+  state.refreshTimer = setInterval(function() {
+    if (gen !== state.routeGeneration) return;
+    loadHealth();
+  }, 15000);
+
+  // Events section
+  var eventsPanel = h('div', { className: 'panel' });
+  var eventsHeader = h('div', { className: 'panel-header' },
+    h('div', { className: 'panel-title', textContent: 'Telegram Events' }),
+    h('button', { className: 'btn', textContent: 'Refresh', onClick: function() { loadTelegramEvents(); } })
+  );
+  eventsPanel.appendChild(eventsHeader);
+
+  // Filter bar
+  var filterEventType = '';
+  var filterStatus = '';
+  var filterChatId = '';
+  var filterAfter = '';
+  var filterBefore = '';
+  var evtOffset = 0;
+  var evtLimit = 20;
+
+  function buildEventsFilter() {
+    var bar = h('div', { className: 'filter-bar' });
+    var fType = h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Event Type' }),
+      h('input', { type: 'text', value: filterEventType, placeholder: 'e.g. tg.inbound.message', onInput: function(e) { filterEventType = e.target.value; } })
+    );
+    var fStatus = h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Status' }),
+      h('input', { type: 'text', value: filterStatus, placeholder: 'e.g. completed', onInput: function(e) { filterStatus = e.target.value; } })
+    );
+    var fChat = h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Chat ID' }),
+      h('input', { type: 'text', value: filterChatId, placeholder: 'Chat ID', onInput: function(e) { filterChatId = e.target.value; } })
+    );
+    var fAfter = h('div', { className: 'filter-field' },
+      h('label', { textContent: 'After' }),
+      h('input', { type: 'datetime-local', value: filterAfter, onInput: function(e) { filterAfter = e.target.value; } })
+    );
+    var fBefore = h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Before' }),
+      h('input', { type: 'datetime-local', value: filterBefore, onInput: function(e) { filterBefore = e.target.value; } })
+    );
+    bar.appendChild(fType);
+    bar.appendChild(fStatus);
+    bar.appendChild(fChat);
+    bar.appendChild(fAfter);
+    bar.appendChild(fBefore);
+    bar.appendChild(h('button', { className: 'btn btn-primary', textContent: 'Apply', onClick: function() { evtOffset = 0; loadTelegramEvents(); } }));
+    bar.appendChild(h('button', { className: 'btn', textContent: 'Clear', onClick: function() {
+      filterEventType = ''; filterStatus = ''; filterChatId = ''; filterAfter = ''; filterBefore = '';
+      evtOffset = 0; loadTelegramEvents();
+    }}));
+    return bar;
+  }
+
+  eventsPanel.appendChild(buildEventsFilter());
+  var eventsBody = h('div', { id: 'tg-events-body' });
+  eventsPanel.appendChild(eventsBody);
+  content.appendChild(eventsPanel);
+
+  async function loadTelegramEvents() {
+    var body = document.getElementById('tg-events-body');
+    if (!body) return;
+    clear(body);
+    body.appendChild(h('div', { className: 'loading', textContent: 'Loading events...' }));
+    state.expandedEventId = null;
+
+    var params = 'limit=' + evtLimit + '&offset=' + evtOffset;
+    if (filterEventType) params += '&event_type=' + encodeURIComponent(filterEventType);
+    if (filterStatus) params += '&status=' + encodeURIComponent(filterStatus);
+    if (filterChatId) params += '&chat_id=' + encodeURIComponent(filterChatId);
+    if (filterAfter) params += '&after=' + encodeURIComponent(filterAfter);
+    if (filterBefore) params += '&before=' + encodeURIComponent(filterBefore);
+
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/telegram/events?' + params);
+      if (gen !== state.routeGeneration) return;
+      if (res.status !== 200) {
+        clear(body);
+        body.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) }));
+        return;
+      }
+      paintTelegramEvents(res.data, body);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      clear(body);
+      body.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function deriveDirection(eventType) {
+    if (!eventType) return '-';
+    if (eventType.indexOf('tg.inbound') === 0) return 'In';
+    if (eventType.indexOf('tg.outbound') === 0) return 'Out';
+    return '-';
+  }
+
+  function truncate(s, len) {
+    if (!s) return '-';
+    if (s.length <= len) return s;
+    return s.substring(0, len) + '...';
+  }
+
+  function paintTelegramEvents(data, body) {
+    clear(body);
+    var events = data.events || [];
+    if (events.length === 0) {
+      body.appendChild(h('div', { className: 'empty-state', textContent: 'No telegram events found.' }));
+      return;
+    }
+
+    var table = h('table', { className: 'data-table' });
+    var thead = h('thead', null,
+      h('tr', null,
+        h('th', { textContent: 'Time' }),
+        h('th', { textContent: 'Type' }),
+        h('th', { textContent: 'Direction' }),
+        h('th', { textContent: 'Chat ID' }),
+        h('th', { textContent: 'Status' }),
+        h('th', { textContent: 'Duration' }),
+        h('th', { textContent: 'Corr. ID' })
+      )
+    );
+    table.appendChild(thead);
+
+    var tbody = h('tbody');
+    for (var i = 0; i < events.length; i++) {
+      (function(evt) {
+        var chatDisplay = truncate(evt.channel || evt.chat_id || '', 12);
+        var chatFull = evt.channel || evt.chat_id || '-';
+        var row = h('tr', { className: 'clickable' },
+          h('td', { textContent: fmtTime(evt.created_at) }),
+          h('td', { textContent: evt.event_type || '-' }),
+          h('td', { textContent: deriveDirection(evt.event_type) }),
+          h('td', { textContent: chatDisplay, title: chatFull }),
+          h('td', null, h('span', { className: 'status ' + statusClass(evt.status || 'unknown'), textContent: evt.status || '-' })),
+          h('td', { textContent: fmtDuration(evt.duration_ms) }),
+          h('td', { textContent: truncate(evt.correlation_id, 12), title: evt.correlation_id || '' })
+        );
+        row.addEventListener('click', function() {
+          expandTelegramEvent(evt.id, row, gen);
+        });
+        tbody.appendChild(row);
+      })(events[i]);
+    }
+    table.appendChild(tbody);
+    body.appendChild(table);
+
+    // Pagination
+    var total = data.total || 0;
+    if (total > 0) {
+      var pag = h('div', { className: 'pagination' },
+        h('span', { textContent: 'Showing ' + (evtOffset + 1) + '-' + Math.min(evtOffset + events.length, total) + ' of ' + total })
+      );
+      if (evtOffset > 0) {
+        pag.appendChild(h('button', { className: 'btn', textContent: 'Previous', onClick: function() { evtOffset = Math.max(0, evtOffset - evtLimit); loadTelegramEvents(); } }));
+      }
+      if (evtOffset + evtLimit < total) {
+        pag.appendChild(h('button', { className: 'btn', textContent: 'Next', onClick: function() { evtOffset += evtLimit; loadTelegramEvents(); } }));
+      }
+      body.appendChild(pag);
+    }
+  }
+
+  async function expandTelegramEvent(eventId, row, gen) {
+    // Collapse if already expanded
+    if (state.expandedEventId === eventId) {
+      var existing = row.nextElementSibling;
+      if (existing && existing.classList.contains('event-detail-row')) existing.remove();
+      state.expandedEventId = null;
+      return;
+    }
+    // Collapse any previous expansion
+    var prev = row.parentNode.querySelector('.event-detail-row');
+    if (prev) prev.remove();
+    state.expandedEventId = eventId;
+
+    // Create placeholder row
+    var detailRow = h('tr', { className: 'event-detail-row' });
+    var detailTd = h('td', { colSpan: '7' });
+    var detailContent = h('div', { className: 'event-detail-content' });
+    detailContent.appendChild(h('div', { className: 'loading', textContent: 'Loading event detail...' }));
+    detailTd.appendChild(detailContent);
+    detailRow.appendChild(detailTd);
+    row.parentNode.insertBefore(detailRow, row.nextSibling);
+
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/telegram/events/' + encodeURIComponent(eventId));
+      if (gen !== state.routeGeneration) return;
+      if (state.expandedEventId !== eventId) return;
+      if (res.status !== 200) {
+        clear(detailContent);
+        detailContent.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) }));
+        return;
+      }
+      paintEventDetail(res.data, detailContent);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      clear(detailContent);
+      detailContent.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function paintEventDetail(data, container) {
+    clear(container);
+    var header = h('div', { className: 'event-detail-header' },
+      h('span', { style: 'font-weight:600;font-size:13px', textContent: 'Event Detail' }),
+      h('button', { className: 'btn', textContent: 'Close', style: 'padding:2px 10px;font-size:11px', onClick: function() {
+        state.expandedEventId = null;
+        var dr = container.closest('.event-detail-row');
+        if (dr) dr.remove();
+      }})
+    );
+    container.appendChild(header);
+
+    var grid = h('div', { className: 'detail-grid' });
+    var fields = [
+      ['Event ID', data.id || '-'],
+      ['Type', data.event_type || '-'],
+      ['Status', data.status || '-'],
+      ['Direction', deriveDirection(data.event_type)],
+      ['Duration', fmtDuration(data.duration_ms)],
+      ['Chat ID', data.channel || '-'],
+      ['Correlation ID', data.correlation_id || '-'],
+      ['Time', fmtTime(data.created_at)],
+    ];
+    for (var f of fields) {
+      grid.appendChild(h('div', { className: 'detail-label', textContent: f[0] }));
+      if (f[0] === 'Status') {
+        grid.appendChild(h('div', { className: 'detail-value' },
+          h('span', { className: 'status ' + statusClass(data.status || 'unknown'), textContent: data.status || '-' })
+        ));
+      } else {
+        grid.appendChild(h('div', { className: 'detail-value', textContent: f[1] }));
+      }
+    }
+    container.appendChild(grid);
+
+    if (data.metadata) {
+      container.appendChild(h('div', { style: 'margin-top:12px;font-size:12px;color:var(--text-dim);font-weight:600', textContent: 'Metadata' }));
+      var pre = h('pre', {
+        style: 'background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);padding:10px;font-size:12px;overflow-x:auto;margin-top:4px',
+        textContent: typeof data.metadata === 'string' ? data.metadata : JSON.stringify(data.metadata, null, 2)
+      });
+      container.appendChild(pre);
+    }
+  }
+
+  await loadTelegramEvents();
+}
+
+// ── Flows tab ────────────────────────────────────────────────────
+async function renderFlows(gen) {
+  var content = document.getElementById('tab-content');
+  clear(content);
+
+  // Subtab toggle
+  var subtabBar = h('div', { className: 'subtab-bar' });
+  function buildSubtabs() {
+    clear(subtabBar);
+    subtabBar.appendChild(h('button', {
+      className: 'subtab' + (state.flowSubTab === 'active' ? ' active' : ''),
+      textContent: 'Active',
+      onClick: function() { state.flowSubTab = 'active'; renderFlows(gen); }
+    }));
+    subtabBar.appendChild(h('button', {
+      className: 'subtab' + (state.flowSubTab === 'history' ? ' active' : ''),
+      textContent: 'History',
+      onClick: function() { state.flowSubTab = 'history'; renderFlows(gen); }
+    }));
+  }
+  buildSubtabs();
+  content.appendChild(subtabBar);
+
+  var body = h('div', { id: 'flows-body' });
+  content.appendChild(body);
+
+  if (state.flowSubTab === 'active') {
+    await renderActiveFlows(gen, body);
+  } else {
+    await renderFlowHistory(gen, body);
+  }
+}
+
+async function renderActiveFlows(gen, container) {
+  clear(container);
+  container.appendChild(h('div', { className: 'loading', textContent: 'Loading active flows...' }));
+
+  async function loadActive() {
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/active');
+      if (gen !== state.routeGeneration) return;
+      if (res.status !== 200) {
+        clear(container);
+        container.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) }));
+        return;
+      }
+      paintActiveFlows(res.data);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      clear(container);
+      container.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function paintActiveFlows(data) {
+    clear(container);
+    var panel = h('div', { className: 'panel' });
+    panel.appendChild(h('div', { className: 'panel-title', textContent: 'Active Flows', style: 'margin-bottom:12px' }));
+
+    var flows = data.flows || [];
+    if (flows.length === 0) {
+      panel.appendChild(h('div', { className: 'empty-state', textContent: 'No active flows.' }));
+      container.appendChild(panel);
+      return;
+    }
+
+    var table = h('table', { className: 'data-table' });
+    var thead = h('thead', null,
+      h('tr', null,
+        h('th', { textContent: 'Chat ID' }),
+        h('th', { textContent: 'Flow Name' }),
+        h('th', { textContent: 'Current Step' }),
+        h('th', { textContent: 'Started' }),
+        h('th', { textContent: 'In Step Since' }),
+        h('th', { textContent: 'Actions' })
+      )
+    );
+    table.appendChild(thead);
+
+    var tbody = h('tbody');
+    for (var i = 0; i < flows.length; i++) {
+      (function(flow) {
+        var row = h('tr', null,
+          h('td', { textContent: flow.chat_id || '-' }),
+          h('td', { textContent: flow.flow_name || '-' }),
+          h('td', { textContent: flow.current_step || '-' }),
+          h('td', { textContent: fmtTime(flow.started_at) }),
+          h('td', { textContent: fmtTime(flow.step_entered_at) }),
+          h('td', null,
+            h('button', {
+              className: 'btn btn-danger', textContent: 'Force Complete',
+              style: 'padding:3px 10px;font-size:11px;margin-right:4px',
+              onClick: function(e) {
+                e.stopPropagation();
+                doForceComplete(flow.chat_id, flow.flow_name, gen);
+              }
+            }),
+            h('button', {
+              className: 'btn btn-primary', textContent: 'Replay...',
+              style: 'padding:3px 10px;font-size:11px',
+              onClick: function(e) {
+                e.stopPropagation();
+                showReplayModal(flow.chat_id, flow.flow_name, flow.current_step, gen);
+              }
+            })
+          )
+        );
+        tbody.appendChild(row);
+      })(flows[i]);
+    }
+    table.appendChild(tbody);
+    panel.appendChild(table);
+    container.appendChild(panel);
+  }
+
+  function doForceComplete(chatId, flowName, gen) {
+    confirmDialog(
+      'Force Complete Flow?',
+      'This will force-complete the flow "' + flowName + '" for chat ' + chatId + '. This cannot be undone.',
+      'Force Complete',
+      'btn-danger',
+      async function() {
+        try {
+          var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/active/' + encodeURIComponent(chatId), { method: 'DELETE' });
+          if (gen !== state.routeGeneration) return;
+          if (res.status === 200) {
+            showNotify(container, 'success', 'Flow force-completed for chat ' + chatId);
+            loadActive();
+          } else {
+            showNotify(container, 'error', apiErrorMsg(res));
+          }
+        } catch (e) {
+          showNotify(container, 'error', 'Error: ' + e.message);
+        }
+      }
+    );
+  }
+
+  function showReplayModal(chatId, flowName, currentStep, gen) {
+    var stepValue = currentStep || '';
+    var modal = h('div', { className: 'modal' },
+      h('h3', { textContent: 'Replay Flow' }),
+      h('p', { textContent: 'Reset flow for chat ' + chatId + ' (' + flowName + ') to a specific step. Current step: ' + (currentStep || 'N/A'), style: 'font-size:13px;color:var(--text-dim);margin-bottom:12px' }),
+      h('div', { className: 'form-group' },
+        h('label', { className: 'form-label', textContent: 'Target Step' }),
+        h('input', { className: 'form-input', type: 'text', value: stepValue, id: 'replay-step-input' }),
+        h('div', { className: 'form-hint', textContent: 'The flow will resume from this step on the next interaction or timeout.' })
+      ),
+      h('div', { className: 'modal-actions' },
+        h('button', { className: 'btn', textContent: 'Cancel', onClick: closeModal }),
+        h('button', { className: 'btn btn-primary', textContent: 'Replay', onClick: async function() {
+          var stepInput = document.getElementById('replay-step-input');
+          var step = stepInput ? stepInput.value.trim() : '';
+          if (!step) return;
+          closeModal();
+          await doReplay(chatId, step, gen);
+        }})
+      )
+    );
+    showModal(modal);
+  }
+
+  async function doReplay(chatId, step, gen) {
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/active/' + encodeURIComponent(chatId) + '/replay', {
+        method: 'POST',
+        body: { step: step }
+      });
+      if (gen !== state.routeGeneration) return;
+      if (res.status === 200) {
+        showNotify(container, 'success', 'Flow replayed to step "' + step + '" for chat ' + chatId);
+        loadActive();
+      } else {
+        showNotify(container, 'error', apiErrorMsg(res));
+      }
+    } catch (e) {
+      showNotify(container, 'error', 'Error: ' + e.message);
+    }
+  }
+
+  await loadActive();
+
+  // Auto-refresh: 10s
+  state.refreshTimer = setInterval(function() {
+    if (gen !== state.routeGeneration) return;
+    loadActive();
+  }, 10000);
+}
+
+async function renderFlowHistory(gen, container) {
+  clear(container);
+
+  var histFilterName = '';
+  var histFilterStatus = '';
+  var histFilterChat = '';
+  var histOffset = 0;
+  var histLimit = 20;
+
+  // Filter bar
+  function buildHistoryFilter() {
+    var bar = h('div', { className: 'filter-bar' });
+    bar.appendChild(h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Flow Name' }),
+      h('input', { type: 'text', value: histFilterName, placeholder: 'Flow name', onInput: function(e) { histFilterName = e.target.value; } })
+    ));
+    var statusSelect = h('select');
+    var opts = [
+      { value: '', label: 'All' },
+      { value: 'completed', label: 'Completed' },
+      { value: 'timed_out', label: 'Timed Out' },
+      { value: 'force_completed', label: 'Force Completed' },
+    ];
+    for (var o of opts) {
+      var opt = h('option', { value: o.value, textContent: o.label });
+      if (o.value === histFilterStatus) opt.selected = true;
+      statusSelect.appendChild(opt);
+    }
+    statusSelect.addEventListener('change', function(e) { histFilterStatus = e.target.value; });
+    bar.appendChild(h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Status' }),
+      statusSelect
+    ));
+    bar.appendChild(h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Chat ID' }),
+      h('input', { type: 'text', value: histFilterChat, placeholder: 'Chat ID', onInput: function(e) { histFilterChat = e.target.value; } })
+    ));
+    bar.appendChild(h('button', { className: 'btn btn-primary', textContent: 'Apply', onClick: function() { histOffset = 0; loadHistory(); } }));
+    bar.appendChild(h('button', { className: 'btn', textContent: 'Clear', onClick: function() {
+      histFilterName = ''; histFilterStatus = ''; histFilterChat = '';
+      histOffset = 0; loadHistory();
+    }}));
+    return bar;
+  }
+
+  container.appendChild(buildHistoryFilter());
+  var histBody = h('div', { id: 'flow-history-body' });
+  container.appendChild(histBody);
+
+  async function loadHistory() {
+    var body = document.getElementById('flow-history-body');
+    if (!body) return;
+    clear(body);
+    body.appendChild(h('div', { className: 'loading', textContent: 'Loading flow history...' }));
+
+    var params = 'limit=' + histLimit + '&offset=' + histOffset;
+    if (histFilterName) params += '&flow_name=' + encodeURIComponent(histFilterName);
+    if (histFilterStatus) params += '&status=' + encodeURIComponent(histFilterStatus);
+    if (histFilterChat) params += '&chat_id=' + encodeURIComponent(histFilterChat);
+
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/history?' + params);
+      if (gen !== state.routeGeneration) return;
+      if (res.status !== 200) {
+        clear(body);
+        body.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) }));
+        return;
+      }
+      paintFlowHistory(res.data, body);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      clear(body);
+      body.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function paintFlowHistory(data, body) {
+    clear(body);
+    var panel = h('div', { className: 'panel' });
+    panel.appendChild(h('div', { className: 'panel-title', textContent: 'Flow History', style: 'margin-bottom:12px' }));
+
+    var history = data.history || [];
+    if (history.length === 0) {
+      panel.appendChild(h('div', { className: 'empty-state', textContent: 'No flow history found.' }));
+      body.appendChild(panel);
+      return;
+    }
+
+    var table = h('table', { className: 'data-table' });
+    var thead = h('thead', null,
+      h('tr', null,
+        h('th', { textContent: 'Chat ID' }),
+        h('th', { textContent: 'Flow Name' }),
+        h('th', { textContent: 'Status' }),
+        h('th', { textContent: 'Final Step' }),
+        h('th', { textContent: 'Started' }),
+        h('th', { textContent: 'Completed' })
+      )
+    );
+    table.appendChild(thead);
+
+    var tbody = h('tbody');
+    for (var r of history) {
+      tbody.appendChild(h('tr', null,
+        h('td', { textContent: r.chat_id || '-' }),
+        h('td', { textContent: r.flow_name || '-' }),
+        h('td', null, h('span', { className: 'status ' + statusClass(r.status || 'unknown'), textContent: r.status || '-' })),
+        h('td', { textContent: r.final_step || '-' }),
+        h('td', { textContent: fmtTime(r.started_at) }),
+        h('td', { textContent: fmtTime(r.completed_at) })
+      ));
+    }
+    table.appendChild(tbody);
+    panel.appendChild(table);
+
+    // Pagination
+    var total = data.total || 0;
+    if (total > 0) {
+      var pag = h('div', { className: 'pagination' },
+        h('span', { textContent: 'Showing ' + (histOffset + 1) + '-' + Math.min(histOffset + history.length, total) + ' of ' + total })
+      );
+      if (histOffset > 0) {
+        pag.appendChild(h('button', { className: 'btn', textContent: 'Previous', onClick: function() { histOffset = Math.max(0, histOffset - histLimit); loadHistory(); } }));
+      }
+      if (histOffset + histLimit < total) {
+        pag.appendChild(h('button', { className: 'btn', textContent: 'Next', onClick: function() { histOffset += histLimit; loadHistory(); } }));
+      }
+      panel.appendChild(pag);
+    }
+    body.appendChild(panel);
+  }
+
+  await loadHistory();
 }
 
 // ── Usage tab ────────────────────────────────────────────────────
