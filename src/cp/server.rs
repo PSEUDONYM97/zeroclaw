@@ -13,7 +13,10 @@ use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
 
 use crate::cp::masking::{
-    collect_key_paths, diff_json, mask_config_secrets, preserve_masked_secrets,
+    apply_json_patch_to_toml, collect_key_paths, collect_secret_writes,
+    compute_secret_fingerprints, diff_json, mask_config_secrets, preserve_masked_secrets,
+    reject_dotted_keys, reject_masked_sentinels, validate_null_targets, validate_patch_paths,
+    SECRET_PATHS_MANIFEST,
 };
 use crate::cp::messaging;
 use crate::db::Registry;
@@ -131,7 +134,9 @@ pub fn build_router(state: CpState) -> Router {
         .route("/instances/:name/logs/download", get(handle_logs_download))
         .route(
             "/instances/:name/config",
-            get(handle_config_get).put(handle_config_put),
+            get(handle_config_get)
+                .put(handle_config_put)
+                .patch(handle_config_patch),
         )
         .route(
             "/instances/:name/config/validate",
@@ -1780,6 +1785,12 @@ struct ConfigBody {
     config: String, // TOML string (used by validate + diff)
 }
 
+#[derive(Deserialize)]
+struct ConfigPatchBody {
+    patch: serde_json::Value,
+    etag: String,
+}
+
 fn compute_config_etag(raw_bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(raw_bytes))
 }
@@ -1869,10 +1880,15 @@ async fn handle_config_get(
             Err(msg) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, &msg),
         };
 
+        let secret_fingerprints = compute_secret_fingerprints(&config);
+        let secret_paths: Vec<&str> = SECRET_PATHS_MANIFEST.to_vec();
+
         ok_json(serde_json::json!({
             "name": name,
             "config_toml": masked_toml,
             "config_masked": masked_json,
+            "secret_fingerprints": secret_fingerprints,
+            "secret_paths": secret_paths,
             "etag": etag,
         }))
     })
@@ -2099,6 +2115,298 @@ async fn handle_config_put(
             &format!("Task join error: {e}"),
         ),
     }
+}
+
+// ── PATCH /api/instances/:name/config ────────────────────────────
+
+async fn handle_config_patch(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+    Json(body): Json<ConfigPatchBody>,
+) -> impl IntoResponse {
+    let db_path = state.db_path.clone();
+    let allow_secret_write = headers
+        .get("x-allow-secret-write")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |v| v.eq_ignore_ascii_case("true"));
+
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to query instance",
+                );
+            }
+        };
+
+        // Step 1: Reject non-object patch root
+        if !body.patch.is_object() {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "patch must be a JSON object",
+            );
+        }
+
+        // Step 2: Reject dotted literal keys
+        if let Err(msg) = reject_dotted_keys(&body.patch, "") {
+            return err_json(StatusCode::BAD_REQUEST, &msg);
+        }
+
+        // Step 3: Reject empty etag
+        if body.etag.is_empty() {
+            return err_json(StatusCode::BAD_REQUEST, "ETag is required");
+        }
+
+        // Step 4-5: Read config file, compute ETag
+        let config_path_str = instance.config_path.clone();
+        let config_path = Path::new(&config_path_str);
+
+        let current_bytes = match std::fs::read(config_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return err_json(StatusCode::NOT_FOUND, "Config file not found")
+            }
+            Err(e) => {
+                tracing::error!("Failed to read config: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to read config file",
+                );
+            }
+        };
+
+        // Step 6: Check ETag
+        let current_etag = compute_config_etag(&current_bytes);
+        if body.etag != current_etag {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ETag mismatch: config modified since last read",
+                    "current_etag": current_etag,
+                })),
+            );
+        }
+
+        // Step 7: Validate patch paths
+        if let Err(invalid_paths) = validate_patch_paths(&body.patch) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Unknown config paths in patch",
+                    "invalid_paths": invalid_paths,
+                })),
+            );
+        }
+
+        // Step 8: Validate null targets
+        if let Err(invalid_nulls) = validate_null_targets(&body.patch) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Cannot set non-optional fields to null",
+                    "invalid_null_paths": invalid_nulls,
+                })),
+            );
+        }
+
+        // Step 9: Reject masked sentinels
+        if let Err(msg) = reject_masked_sentinels(&body.patch) {
+            return err_json(StatusCode::BAD_REQUEST, &msg);
+        }
+
+        // Step 10: Collect secret writes, block without header
+        let secret_writes = collect_secret_writes(&body.patch);
+        if !secret_writes.is_empty() && !allow_secret_write {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Patch contains secret fields blocked by default",
+                    "blocked_fields": secret_writes,
+                    "hint": "Set header X-Allow-Secret-Write: true to allow",
+                })),
+            );
+        }
+
+        // Step 11: Acquire lifecycle lock
+        let inst_dir = lifecycle::instance_dir_from(&instance);
+        let _lock = match lifecycle::try_lifecycle_lock(&inst_dir) {
+            Ok(lifecycle::LockOutcome::Acquired(f)) => f,
+            Ok(lifecycle::LockOutcome::Contended) => {
+                return err_json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Lifecycle lock held (concurrent operation in progress)",
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to acquire lifecycle lock: {e:#}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to acquire lifecycle lock",
+                );
+            }
+        };
+
+        // Step 12: Re-read config, recheck ETag
+        let recheck_bytes = match std::fs::read(config_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("Failed to re-read config: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to re-read config file",
+                );
+            }
+        };
+        let recheck_etag = compute_config_etag(&recheck_bytes);
+        if body.etag != recheck_etag {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ETag mismatch: config modified since last read",
+                    "current_etag": recheck_etag,
+                })),
+            );
+        }
+
+        let recheck_str = match String::from_utf8(recheck_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Config file is not valid UTF-8",
+                )
+            }
+        };
+
+        // Step 13: Apply JSON patch to TOML
+        let modified_toml = match apply_json_patch_to_toml(&recheck_str, &body.patch) {
+            Ok(t) => t,
+            Err(msg) => {
+                return err_json(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Failed to apply patch: {msg}"),
+                )
+            }
+        };
+
+        // Step 14: Parse result back to Config struct (validation)
+        let _validated: crate::config::schema::Config = match toml::from_str(&modified_toml) {
+            Ok(c) => c,
+            Err(e) => {
+                return err_json(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Patch produces invalid config: {e}"),
+                )
+            }
+        };
+
+        // Step 15: Atomic write
+        if let Err(e) = atomic_write_config(config_path, &modified_toml) {
+            tracing::error!("Failed to save config: {e:#}");
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to save config: {e}"),
+            );
+        }
+
+        // Step 16: Compute new ETag
+        let new_bytes = match std::fs::read(config_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("Failed to read saved config: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Config saved but failed to compute new ETag",
+                );
+            }
+        };
+        let new_etag = compute_config_etag(&new_bytes);
+
+        // Check if instance is running
+        let (live_status, _live_pid) =
+            lifecycle::live_status(&inst_dir).unwrap_or(("unknown".to_string(), None));
+        let restart_recommended = live_status == "running";
+
+        // Step 17: Return success
+        ok_json(serde_json::json!({
+            "status": "saved",
+            "etag": new_etag,
+            "restart_recommended": restart_recommended,
+        }))
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+/// Atomic write: write to temp file, fsync, rename over target.
+fn atomic_write_config(path: &Path, content: &str) -> anyhow::Result<()> {
+    use std::fs::{self, File, OpenOptions};
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Config path has no parent"))?;
+
+    let temp_path = parent.join(format!(
+        ".config.toml.tmp-{}",
+        uuid::Uuid::new_v4()
+    ));
+
+    let mut f = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)?;
+    f.write_all(content.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+
+    // Backup existing
+    let backup_path = parent.join("config.toml.bak");
+    let had_existing = path.exists();
+    if had_existing {
+        fs::copy(path, &backup_path)?;
+    }
+
+    if let Err(e) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        if had_existing && backup_path.exists() {
+            let _ = fs::copy(&backup_path, path);
+        }
+        anyhow::bail!("Atomic rename failed: {e}");
+    }
+
+    // Directory fsync
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
+    }
+
+    if had_existing {
+        let _ = fs::remove_file(&backup_path);
+    }
+
+    Ok(())
 }
 
 // ── POST /api/instances/:name/config/validate ───────────────────
