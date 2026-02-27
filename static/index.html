@@ -355,6 +355,7 @@ a:hover { text-decoration: underline; }
   border-radius: var(--radius); color: var(--text-dim); cursor: pointer;
 }
 .subtab.active { border-color: var(--blue); color: var(--blue); }
+.subtab .badge { display: inline-block; background: var(--yellow); color: var(--bg); font-size: 11px; padding: 1px 6px; border-radius: 10px; margin-left: 6px; font-weight: 600; }
 
 /* Inline event detail */
 .event-detail-row td { padding: 0 !important; border-bottom: 1px solid var(--border); }
@@ -376,6 +377,16 @@ a:hover { text-decoration: underline; }
 .status-force-completed::before { background: var(--orange); }
 .status-active { color: var(--blue); }
 .status-active::before { background: var(--blue); }
+.status-draft { color: var(--text-dim); }
+.status-draft::before { background: var(--text-dim); }
+.status-validated { color: var(--green); }
+.status-validated::before { background: var(--green); }
+.status-pending-review { color: var(--yellow); }
+.status-pending-review::before { background: var(--yellow); }
+.status-deactivated { color: var(--text-dim); }
+.status-deactivated::before { background: var(--text-dim); }
+.status-rejected { color: var(--red); }
+.status-rejected::before { background: var(--red); }
 
 /* Clickable rows */
 .data-table tr.clickable { cursor: pointer; }
@@ -441,6 +452,11 @@ function statusClass(s) {
   if (s === 'timed_out') return 'status-timed-out';
   if (s === 'force_completed') return 'status-force-completed';
   if (s === 'active') return 'status-active';
+  if (s === 'draft') return 'status-draft';
+  if (s === 'validated') return 'status-validated';
+  if (s === 'pending_review') return 'status-pending-review';
+  if (s === 'deactivated') return 'status-deactivated';
+  if (s === 'rejected') return 'status-rejected';
   return 'status-unknown';
 }
 
@@ -1138,6 +1154,81 @@ async function renderLogs(gen) {
 }
 
 // ── Config tab ───────────────────────────────────────────────────
+// ── Structured Config Editor (Phase 18B) ─────────────────────────
+
+var _cfgTouched = {};
+var _cfgFormState = {};
+var _cfgSecretPaths = [];
+var _cfgFingerprints = {};
+var _routeApiKeyChanged = {};
+var _cfgMaskedData = null;
+
+function markTouched(path) { _cfgTouched[path] = true; }
+function clearTouched(path) { delete _cfgTouched[path]; }
+
+function setNestedPath(obj, dottedPath, value) {
+  var parts = dottedPath.split('.');
+  var cur = obj;
+  for (var i = 0; i < parts.length - 1; i++) {
+    if (!cur[parts[i]] || typeof cur[parts[i]] !== 'object') cur[parts[i]] = {};
+    cur = cur[parts[i]];
+  }
+  cur[parts[parts.length - 1]] = value;
+}
+
+function getNestedPath(obj, dottedPath) {
+  var parts = dottedPath.split('.');
+  var cur = obj;
+  for (var i = 0; i < parts.length; i++) {
+    if (cur == null) return undefined;
+    cur = cur[parts[i]];
+  }
+  return cur;
+}
+
+function buildPatchFromTouched() {
+  var patch = {};
+  for (var path in _cfgTouched) {
+    setNestedPath(patch, path, _cfgFormState[path]);
+  }
+  if (patch.model_routes) {
+    patch.model_routes = buildModelRoutesForPatch();
+  }
+  return patch;
+}
+
+function buildModelRoutesForPatch() {
+  var routes = _cfgFormState['model_routes'] || [];
+  return routes.map(function(route, i) {
+    var clean = { hint: route.hint, provider: route.provider, model: route.model };
+    if (_routeApiKeyChanged[i]) {
+      clean.api_key = route.api_key;
+    }
+    return clean;
+  });
+}
+
+function cfgIsSecretPath(dottedPath) {
+  if (_cfgSecretPaths.indexOf(dottedPath) !== -1) return true;
+  if (/^model_routes\[\d+\]\.api_key$/.test(dottedPath)) {
+    return _cfgSecretPaths.indexOf('model_routes[*].api_key') !== -1;
+  }
+  return false;
+}
+
+function patchContainsSecrets(patch) {
+  for (var path in _cfgTouched) {
+    if (cfgIsSecretPath(path)) return true;
+  }
+  if (patch.model_routes && Array.isArray(patch.model_routes)) {
+    for (var i = 0; i < patch.model_routes.length; i++) {
+      if (patch.model_routes[i].api_key !== undefined) return true;
+    }
+  }
+  if (patch.gateway && patch.gateway.paired_tokens !== undefined) return true;
+  return false;
+}
+
 async function renderConfig(gen) {
   var content = document.getElementById('tab-content');
   clear(content);
@@ -1152,6 +1243,12 @@ async function renderConfig(gen) {
       return;
     }
     state.configEtag = res.data.etag;
+    _cfgTouched = {};
+    _cfgSecretPaths = res.data.secret_paths || [];
+    _cfgFingerprints = res.data.secret_fingerprints || {};
+    _cfgMaskedData = res.data.config_masked || {};
+    _routeApiKeyChanged = {};
+    _cfgFormState = JSON.parse(JSON.stringify(_cfgMaskedData));
     paintConfig(res.data);
   } catch (e) {
     if (e.name === 'AbortError') return;
@@ -1167,124 +1264,600 @@ function paintConfig(data) {
   var notifyArea = h('div', { id: 'config-notify' });
   content.appendChild(notifyArea);
 
-  var panel = h('div', { className: 'panel' });
-  var header = h('div', { className: 'panel-header' },
-    h('span', { className: 'panel-title', textContent: 'Configuration (TOML)' }),
+  var header = h('div', { style: 'display:flex;justify-content:space-between;align-items:center;margin-bottom:16px' },
+    h('h2', { style: 'margin:0;color:var(--text)', textContent: 'Configuration' }),
     h('div', { className: 'btn-group' },
-      h('button', { className: 'btn', id: 'btn-validate', textContent: 'Validate' }),
-      h('button', { className: 'btn', id: 'btn-diff', textContent: 'Diff' }),
-      h('button', { className: 'btn btn-primary', id: 'btn-save', textContent: 'Save' })
+      h('button', { className: 'btn btn-primary', id: 'btn-save', textContent: 'Save Changes', onClick: doConfigPatch })
     )
   );
-  panel.appendChild(header);
-
-  var editor = h('textarea', { className: 'config-editor', id: 'config-editor' });
-  editor.value = data.config_toml || '';
-  panel.appendChild(editor);
-
-  var diffArea = h('div', { id: 'diff-area' });
-  panel.appendChild(diffArea);
+  content.appendChild(header);
 
   var conflictArea = h('div', { id: 'conflict-area' });
-  panel.appendChild(conflictArea);
+  content.appendChild(conflictArea);
 
-  content.appendChild(panel);
+  var cfg = data.config_masked || {};
 
-  // Wire up buttons
-  document.getElementById('btn-validate').addEventListener('click', doValidate);
-  document.getElementById('btn-diff').addEventListener('click', doDiff);
-  document.getElementById('btn-save').addEventListener('click', doSave);
+  // Section 1: Model Settings (expanded by default)
+  content.appendChild(buildSection('Model Settings', true, function(body) {
+    body.appendChild(buildSecretField('api_key', 'API Key'));
+    body.appendChild(buildTextInput('default_provider', 'Default Provider', cfg.default_provider || ''));
+    body.appendChild(buildTextInput('default_model', 'Default Model', cfg.default_model || ''));
+    body.appendChild(buildNumberInput('default_temperature', 'Temperature', cfg.default_temperature, 0, 2, 0.1));
+  }));
+
+  // Section 2: Channels
+  content.appendChild(buildSection('Channels', false, function(body) {
+    body.appendChild(buildCheckbox('channels_config.cli', 'CLI Enabled', cfg.channels_config && cfg.channels_config.cli));
+    body.appendChild(buildChannelBlock('telegram', 'Telegram', cfg.channels_config, [
+      { type: 'secret', path: 'bot_token', label: 'Bot Token' },
+      { type: 'list', path: 'allowed_users', label: 'Allowed Users' },
+      { type: 'text', path: 'stt_endpoint', label: 'STT Endpoint' },
+      { type: 'check', path: 'flows_enabled', label: 'Flows Enabled' },
+    ]));
+    body.appendChild(buildChannelBlock('discord', 'Discord', cfg.channels_config, [
+      { type: 'secret', path: 'bot_token', label: 'Bot Token' },
+      { type: 'text', path: 'guild_id', label: 'Guild ID' },
+      { type: 'list', path: 'allowed_users', label: 'Allowed Users' },
+    ]));
+    body.appendChild(buildChannelBlock('slack', 'Slack', cfg.channels_config, [
+      { type: 'secret', path: 'bot_token', label: 'Bot Token' },
+      { type: 'secret', path: 'app_token', label: 'App Token' },
+      { type: 'text', path: 'channel_id', label: 'Channel ID' },
+      { type: 'list', path: 'allowed_users', label: 'Allowed Users' },
+    ]));
+    body.appendChild(buildChannelBlock('webhook', 'Webhook', cfg.channels_config, [
+      { type: 'num', path: 'port', label: 'Port' },
+      { type: 'secret', path: 'secret', label: 'Secret' },
+    ]));
+    body.appendChild(buildChannelBlock('matrix', 'Matrix', cfg.channels_config, [
+      { type: 'text', path: 'homeserver', label: 'Homeserver' },
+      { type: 'secret', path: 'access_token', label: 'Access Token' },
+      { type: 'text', path: 'room_id', label: 'Room ID' },
+      { type: 'list', path: 'allowed_users', label: 'Allowed Users' },
+    ]));
+    body.appendChild(buildChannelBlock('whatsapp', 'WhatsApp', cfg.channels_config, [
+      { type: 'secret', path: 'access_token', label: 'Access Token' },
+      { type: 'text', path: 'phone_number_id', label: 'Phone Number ID' },
+      { type: 'secret', path: 'verify_token', label: 'Verify Token' },
+      { type: 'secret', path: 'app_secret', label: 'App Secret' },
+      { type: 'list', path: 'allowed_numbers', label: 'Allowed Numbers' },
+    ]));
+    body.appendChild(buildChannelBlock('irc', 'IRC', cfg.channels_config, [
+      { type: 'text', path: 'server', label: 'Server' },
+      { type: 'num', path: 'port', label: 'Port' },
+      { type: 'text', path: 'nickname', label: 'Nickname' },
+      { type: 'text', path: 'username', label: 'Username' },
+      { type: 'list', path: 'channels', label: 'Channels' },
+      { type: 'list', path: 'allowed_users', label: 'Allowed Users' },
+      { type: 'secret', path: 'server_password', label: 'Server Password' },
+      { type: 'secret', path: 'nickserv_password', label: 'NickServ Password' },
+      { type: 'secret', path: 'sasl_password', label: 'SASL Password' },
+      { type: 'check', path: 'verify_tls', label: 'Verify TLS' },
+    ]));
+    body.appendChild(buildChannelBlock('email', 'Email', cfg.channels_config, [
+      { type: 'text', path: 'imap_host', label: 'IMAP Host' },
+      { type: 'num', path: 'imap_port', label: 'IMAP Port' },
+      { type: 'text', path: 'imap_folder', label: 'IMAP Folder' },
+      { type: 'text', path: 'smtp_host', label: 'SMTP Host' },
+      { type: 'num', path: 'smtp_port', label: 'SMTP Port' },
+      { type: 'check', path: 'smtp_tls', label: 'SMTP TLS' },
+      { type: 'text', path: 'username', label: 'Username' },
+      { type: 'secret', path: 'password', label: 'Password' },
+      { type: 'text', path: 'from_address', label: 'From Address' },
+      { type: 'num', path: 'poll_interval_secs', label: 'Poll Interval (s)' },
+      { type: 'list', path: 'allowed_senders', label: 'Allowed Senders' },
+    ]));
+    body.appendChild(buildChannelBlock('imessage', 'iMessage', cfg.channels_config, [
+      { type: 'list', path: 'allowed_contacts', label: 'Allowed Contacts' },
+    ]));
+    body.appendChild(buildChannelBlock('cp_relay', 'CP Relay', cfg.channels_config, [
+      { type: 'text', path: 'cp_url', label: 'CP URL' },
+    ]));
+  }));
+
+  // Section 3: Gateway
+  content.appendChild(buildSection('Gateway', false, function(body) {
+    body.appendChild(buildNumberInput('gateway.port', 'Port', cfg.gateway && cfg.gateway.port, 1, 65535, 1));
+    body.appendChild(buildTextInput('gateway.host', 'Host', cfg.gateway && cfg.gateway.host || ''));
+    body.appendChild(buildCheckbox('gateway.require_pairing', 'Require Pairing', cfg.gateway && cfg.gateway.require_pairing));
+    body.appendChild(buildCheckbox('gateway.allow_public_bind', 'Allow Public Bind', cfg.gateway && cfg.gateway.allow_public_bind));
+    body.appendChild(buildPairedTokensDisplay(cfg.gateway));
+    body.appendChild(buildNumberInput('gateway.pair_rate_limit_per_minute', 'Pair Rate Limit/min', cfg.gateway && cfg.gateway.pair_rate_limit_per_minute, 1, 1000, 1));
+    body.appendChild(buildNumberInput('gateway.webhook_rate_limit_per_minute', 'Webhook Rate Limit/min', cfg.gateway && cfg.gateway.webhook_rate_limit_per_minute, 1, 10000, 1));
+    body.appendChild(buildNumberInput('gateway.idempotency_ttl_secs', 'Idempotency TTL (s)', cfg.gateway && cfg.gateway.idempotency_ttl_secs, 0, 86400, 1));
+  }));
+
+  // Section 4: Heartbeat
+  content.appendChild(buildSection('Heartbeat', false, function(body) {
+    body.appendChild(buildCheckbox('heartbeat.enabled', 'Enabled', cfg.heartbeat && cfg.heartbeat.enabled));
+    body.appendChild(buildNumberInput('heartbeat.interval_minutes', 'Interval (min)', cfg.heartbeat && cfg.heartbeat.interval_minutes, 1, 1440, 1));
+  }));
+
+  // Section 5: Autonomy
+  content.appendChild(buildSection('Autonomy', false, function(body) {
+    body.appendChild(buildSelect('autonomy.level', 'Level', cfg.autonomy && cfg.autonomy.level || 'supervised', ['readonly', 'supervised', 'full']));
+    body.appendChild(buildCheckbox('autonomy.workspace_only', 'Workspace Only', cfg.autonomy && cfg.autonomy.workspace_only));
+    body.appendChild(buildListInput('autonomy.allowed_commands', 'Allowed Commands', cfg.autonomy && cfg.autonomy.allowed_commands || []));
+    body.appendChild(buildListInput('autonomy.forbidden_paths', 'Forbidden Paths', cfg.autonomy && cfg.autonomy.forbidden_paths || []));
+    body.appendChild(buildNumberInput('autonomy.max_actions_per_hour', 'Max Actions/Hour', cfg.autonomy && cfg.autonomy.max_actions_per_hour, 1, 1000, 1));
+    body.appendChild(buildNumberInput('autonomy.max_cost_per_day_cents', 'Max Cost/Day (cents)', cfg.autonomy && cfg.autonomy.max_cost_per_day_cents, 0, 100000, 1));
+    body.appendChild(buildCheckbox('autonomy.require_approval_for_medium_risk', 'Require Approval (Medium Risk)', cfg.autonomy && cfg.autonomy.require_approval_for_medium_risk));
+    body.appendChild(buildCheckbox('autonomy.block_high_risk_commands', 'Block High Risk Commands', cfg.autonomy && cfg.autonomy.block_high_risk_commands));
+  }));
+
+  // Section 6: Memory
+  content.appendChild(buildSection('Memory', false, function(body) {
+    body.appendChild(buildSelect('memory.backend', 'Backend', cfg.memory && cfg.memory.backend || 'sqlite', ['sqlite', 'markdown', 'none']));
+    body.appendChild(buildCheckbox('memory.auto_save', 'Auto Save', cfg.memory && cfg.memory.auto_save));
+    body.appendChild(buildCheckbox('memory.hygiene_enabled', 'Hygiene Enabled', cfg.memory && cfg.memory.hygiene_enabled));
+    body.appendChild(buildNumberInput('memory.archive_after_days', 'Archive After (days)', cfg.memory && cfg.memory.archive_after_days, 1, 365, 1));
+    body.appendChild(buildNumberInput('memory.purge_after_days', 'Purge After (days)', cfg.memory && cfg.memory.purge_after_days, 1, 365, 1));
+    body.appendChild(buildNumberInput('memory.conversation_retention_days', 'Conversation Retention (days)', cfg.memory && cfg.memory.conversation_retention_days, 1, 365, 1));
+    body.appendChild(buildTextInput('memory.embedding_provider', 'Embedding Provider', cfg.memory && cfg.memory.embedding_provider || ''));
+    body.appendChild(buildTextInput('memory.embedding_model', 'Embedding Model', cfg.memory && cfg.memory.embedding_model || ''));
+    body.appendChild(buildNumberInput('memory.embedding_dimensions', 'Embedding Dimensions', cfg.memory && cfg.memory.embedding_dimensions, 1, 10000, 1));
+    body.appendChild(buildNumberInput('memory.vector_weight', 'Vector Weight', cfg.memory && cfg.memory.vector_weight, 0, 1, 0.1));
+    body.appendChild(buildNumberInput('memory.keyword_weight', 'Keyword Weight', cfg.memory && cfg.memory.keyword_weight, 0, 1, 0.1));
+    body.appendChild(buildNumberInput('memory.embedding_cache_size', 'Embedding Cache Size', cfg.memory && cfg.memory.embedding_cache_size, 0, 1000000, 100));
+    body.appendChild(buildNumberInput('memory.chunk_max_tokens', 'Chunk Max Tokens', cfg.memory && cfg.memory.chunk_max_tokens, 1, 10000, 1));
+  }));
+
+  // Section 7: Observability
+  content.appendChild(buildSection('Observability', false, function(body) {
+    var obsBackend = cfg.observability && cfg.observability.backend || 'none';
+    body.appendChild(buildSelect('observability.backend', 'Backend', obsBackend, ['none', 'log', 'prometheus', 'otel']));
+    var otelFields = h('div', { id: 'otel-fields', style: obsBackend === 'otel' ? '' : 'display:none' });
+    otelFields.appendChild(buildTextInput('observability.otel_endpoint', 'OTEL Endpoint', cfg.observability && cfg.observability.otel_endpoint || ''));
+    otelFields.appendChild(buildTextInput('observability.otel_service_name', 'OTEL Service Name', cfg.observability && cfg.observability.otel_service_name || ''));
+    body.appendChild(otelFields);
+  }));
+
+  // Section 8: Runtime
+  content.appendChild(buildSection('Runtime', false, function(body) {
+    var runtimeKind = cfg.runtime && cfg.runtime.kind || 'native';
+    body.appendChild(buildSelect('runtime.kind', 'Kind', runtimeKind, ['native', 'docker']));
+    var dockerFields = h('div', { id: 'docker-fields', style: runtimeKind === 'docker' ? '' : 'display:none' });
+    var dk = (cfg.runtime && cfg.runtime.docker) || {};
+    dockerFields.appendChild(buildTextInput('runtime.docker.image', 'Image', dk.image || ''));
+    dockerFields.appendChild(buildTextInput('runtime.docker.network', 'Network', dk.network || ''));
+    dockerFields.appendChild(buildNumberInput('runtime.docker.memory_limit_mb', 'Memory Limit (MB)', dk.memory_limit_mb, 0, 65536, 1));
+    dockerFields.appendChild(buildNumberInput('runtime.docker.cpu_limit', 'CPU Limit', dk.cpu_limit, 0, 128, 0.1));
+    dockerFields.appendChild(buildCheckbox('runtime.docker.read_only_rootfs', 'Read-Only Root FS', dk.read_only_rootfs));
+    dockerFields.appendChild(buildCheckbox('runtime.docker.mount_workspace', 'Mount Workspace', dk.mount_workspace));
+    dockerFields.appendChild(buildListInput('runtime.docker.allowed_workspace_roots', 'Allowed Workspace Roots', dk.allowed_workspace_roots || []));
+    body.appendChild(dockerFields);
+  }));
+
+  // Section 9: Reliability
+  content.appendChild(buildSection('Reliability', false, function(body) {
+    var rel = cfg.reliability || {};
+    body.appendChild(buildNumberInput('reliability.provider_retries', 'Provider Retries', rel.provider_retries, 0, 10, 1));
+    body.appendChild(buildNumberInput('reliability.provider_backoff_ms', 'Provider Backoff (ms)', rel.provider_backoff_ms, 0, 60000, 100));
+    body.appendChild(buildListInput('reliability.fallback_providers', 'Fallback Providers', rel.fallback_providers || []));
+    body.appendChild(buildNumberInput('reliability.channel_initial_backoff_secs', 'Channel Initial Backoff (s)', rel.channel_initial_backoff_secs, 0, 3600, 1));
+    body.appendChild(buildNumberInput('reliability.channel_max_backoff_secs', 'Channel Max Backoff (s)', rel.channel_max_backoff_secs, 0, 86400, 1));
+    body.appendChild(buildNumberInput('reliability.scheduler_poll_secs', 'Scheduler Poll (s)', rel.scheduler_poll_secs, 1, 3600, 1));
+    body.appendChild(buildNumberInput('reliability.scheduler_retries', 'Scheduler Retries', rel.scheduler_retries, 0, 10, 1));
+  }));
+
+  // Section 10: Model Routes
+  content.appendChild(buildSection('Model Routes', false, function(body) {
+    body.appendChild(buildModelRoutesEditor(cfg.model_routes || []));
+  }));
+
+  // Section 11: Tunnel
+  content.appendChild(buildSection('Tunnel', false, function(body) {
+    var tp = cfg.tunnel && cfg.tunnel.provider || 'none';
+    body.appendChild(buildSelect('tunnel.provider', 'Provider', tp, ['none', 'cloudflare', 'tailscale', 'ngrok', 'custom']));
+    var cfDiv = h('div', { id: 'tunnel-cloudflare', style: tp === 'cloudflare' ? '' : 'display:none' });
+    cfDiv.appendChild(buildSecretField('tunnel.cloudflare.token', 'Cloudflare Token'));
+    body.appendChild(cfDiv);
+    var tsDiv = h('div', { id: 'tunnel-tailscale', style: tp === 'tailscale' ? '' : 'display:none' });
+    tsDiv.appendChild(buildCheckbox('tunnel.tailscale.funnel', 'Funnel', cfg.tunnel && cfg.tunnel.tailscale && cfg.tunnel.tailscale.funnel));
+    tsDiv.appendChild(buildTextInput('tunnel.tailscale.hostname', 'Hostname', cfg.tunnel && cfg.tunnel.tailscale && cfg.tunnel.tailscale.hostname || ''));
+    body.appendChild(tsDiv);
+    var ngDiv = h('div', { id: 'tunnel-ngrok', style: tp === 'ngrok' ? '' : 'display:none' });
+    ngDiv.appendChild(buildSecretField('tunnel.ngrok.auth_token', 'Auth Token'));
+    ngDiv.appendChild(buildTextInput('tunnel.ngrok.domain', 'Domain', cfg.tunnel && cfg.tunnel.ngrok && cfg.tunnel.ngrok.domain || ''));
+    body.appendChild(ngDiv);
+    var cuDiv = h('div', { id: 'tunnel-custom', style: tp === 'custom' ? '' : 'display:none' });
+    cuDiv.appendChild(buildTextInput('tunnel.custom.start_command', 'Start Command', cfg.tunnel && cfg.tunnel.custom && cfg.tunnel.custom.start_command || ''));
+    cuDiv.appendChild(buildTextInput('tunnel.custom.health_url', 'Health URL', cfg.tunnel && cfg.tunnel.custom && cfg.tunnel.custom.health_url || ''));
+    cuDiv.appendChild(buildTextInput('tunnel.custom.url_pattern', 'URL Pattern', cfg.tunnel && cfg.tunnel.custom && cfg.tunnel.custom.url_pattern || ''));
+    body.appendChild(cuDiv);
+  }));
+
+  // Section 12: Composio
+  content.appendChild(buildSection('Composio', false, function(body) {
+    body.appendChild(buildCheckbox('composio.enabled', 'Enabled', cfg.composio && cfg.composio.enabled));
+    body.appendChild(buildSecretField('composio.api_key', 'API Key'));
+    body.appendChild(buildTextInput('composio.entity_id', 'Entity ID', cfg.composio && cfg.composio.entity_id || ''));
+  }));
+
+  // Section 13: Secrets
+  content.appendChild(buildSection('Secrets', false, function(body) {
+    body.appendChild(buildCheckbox('secrets.encrypt', 'Encrypt', cfg.secrets && cfg.secrets.encrypt));
+  }));
+
+  // Section 14: Browser
+  content.appendChild(buildSection('Browser', false, function(body) {
+    body.appendChild(buildCheckbox('browser.enabled', 'Enabled', cfg.browser && cfg.browser.enabled));
+    body.appendChild(buildListInput('browser.allowed_domains', 'Allowed Domains', cfg.browser && cfg.browser.allowed_domains || []));
+    body.appendChild(buildTextInput('browser.session_name', 'Session Name', cfg.browser && cfg.browser.session_name || ''));
+  }));
+
+  // Section 15: Identity
+  content.appendChild(buildSection('Identity', false, function(body) {
+    body.appendChild(buildSelect('identity.format', 'Format', cfg.identity && cfg.identity.format || 'openclaw', ['openclaw', 'aieos']));
+    body.appendChild(buildTextInput('identity.aieos_path', 'AIEOS Path', cfg.identity && cfg.identity.aieos_path || ''));
+    body.appendChild(buildTextInput('identity.aieos_inline', 'AIEOS Inline', cfg.identity && cfg.identity.aieos_inline || ''));
+  }));
 }
 
-async function doValidate() {
-  var notify = document.getElementById('config-notify');
-  var editor = document.getElementById('config-editor');
-  if (!editor) return;
-  try {
-    var res = await api('/instances/' + encodeURIComponent(state.instance) + '/config/validate', {
-      method: 'POST',
-      body: { config: editor.value }
-    });
-    if (res.data && res.data.valid) {
-      showNotify(notify, 'success', 'Config is valid');
-    } else {
-      showNotify(notify, 'error', 'Invalid: ' + ((res.data && res.data.error) || 'Unknown error'));
+// ── Section builder ──────────────────────────────────────────────
+
+function buildSection(title, expanded, contentFn) {
+  var body = h('div', { style: expanded ? 'padding:12px' : 'padding:12px;display:none' });
+  contentFn(body);
+  var arrow = h('span', { textContent: expanded ? '\u25BC' : '\u25B6', style: 'margin-right:8px;font-size:11px' });
+  var hdr = h('div', {
+    style: 'padding:10px 12px;cursor:pointer;display:flex;align-items:center;border-bottom:1px solid var(--border);user-select:none',
+    onClick: function() {
+      var shown = body.style.display !== 'none';
+      body.style.display = shown ? 'none' : '';
+      arrow.textContent = shown ? '\u25B6' : '\u25BC';
     }
-  } catch (e) {
-    if (e.name === 'AbortError') return;
-    showNotify(notify, 'error', 'Validation failed: ' + e.message);
+  }, arrow, h('span', { style: 'font-weight:600;color:var(--text)', textContent: title }));
+  return h('div', { className: 'panel', style: 'margin-bottom:8px' }, hdr, body);
+}
+
+// ── Field builders ───────────────────────────────────────────────
+
+function buildTextInput(path, label, value) {
+  var input = h('input', { className: 'form-input', type: 'text', value: value || '' });
+  input.addEventListener('input', function() {
+    _cfgFormState[path] = this.value;
+    markTouched(path);
+  });
+  return h('div', { className: 'form-group' },
+    h('label', { className: 'form-label', textContent: label }),
+    input
+  );
+}
+
+function buildNumberInput(path, label, value, min, max, step) {
+  var input = h('input', { className: 'form-input', type: 'number', value: value != null ? value : '' });
+  if (min != null) input.setAttribute('min', min);
+  if (max != null) input.setAttribute('max', max);
+  if (step != null) input.setAttribute('step', step);
+  input.addEventListener('input', function() {
+    var v = step && step < 1 ? parseFloat(this.value) : parseInt(this.value, 10);
+    if (!isNaN(v)) { _cfgFormState[path] = v; markTouched(path); }
+  });
+  return h('div', { className: 'form-group' },
+    h('label', { className: 'form-label', textContent: label }),
+    input
+  );
+}
+
+function buildCheckbox(path, label, checked) {
+  var input = h('input', { type: 'checkbox' });
+  input.checked = !!checked;
+  input.addEventListener('change', function() {
+    _cfgFormState[path] = this.checked;
+    markTouched(path);
+  });
+  return h('div', { className: 'form-group', style: 'display:flex;align-items:center;gap:8px' },
+    input,
+    h('label', { style: 'color:var(--text);cursor:pointer', textContent: label })
+  );
+}
+
+function buildSelect(path, label, value, options) {
+  var sel = h('select', { className: 'form-input' });
+  for (var i = 0; i < options.length; i++) {
+    var opt = h('option', { value: options[i], textContent: options[i] });
+    if (options[i] === value) opt.selected = true;
+    sel.appendChild(opt);
   }
+  sel.addEventListener('change', function() {
+    _cfgFormState[path] = this.value;
+    markTouched(path);
+    // Conditional visibility toggles
+    if (path === 'observability.backend') {
+      var otel = document.getElementById('otel-fields');
+      if (otel) otel.style.display = this.value === 'otel' ? '' : 'none';
+    }
+    if (path === 'runtime.kind') {
+      var dk = document.getElementById('docker-fields');
+      if (dk) dk.style.display = this.value === 'docker' ? '' : 'none';
+    }
+    if (path === 'tunnel.provider') {
+      ['cloudflare','tailscale','ngrok','custom'].forEach(function(p) {
+        var el = document.getElementById('tunnel-' + p);
+        if (el) el.style.display = p === sel.value ? '' : 'none';
+      });
+    }
+  });
+  return h('div', { className: 'form-group' },
+    h('label', { className: 'form-label', textContent: label }),
+    sel
+  );
 }
 
-async function doDiff() {
-  var editor = document.getElementById('config-editor');
-  var diffArea = document.getElementById('diff-area');
-  if (!editor || !diffArea) return;
-  clear(diffArea);
-  try {
-    var res = await api('/instances/' + encodeURIComponent(state.instance) + '/config/diff', {
-      method: 'POST',
-      body: { config: editor.value }
-    });
-    if (res.status !== 200) {
-      var notify = document.getElementById('config-notify');
-      showNotify(notify, 'error', (res.data && res.data.error) || 'Diff failed');
-      return;
+function buildListInput(path, label, items) {
+  var container = h('div', { className: 'form-group' });
+  container.appendChild(h('label', { className: 'form-label', textContent: label }));
+  var listDiv = h('div');
+  var currentItems = items ? items.slice() : [];
+
+  function renderList() {
+    clear(listDiv);
+    for (var i = 0; i < currentItems.length; i++) {
+      (function(idx) {
+        var row = h('div', { style: 'display:flex;gap:4px;margin-bottom:4px' },
+          h('input', { className: 'form-input', type: 'text', value: currentItems[idx], style: 'flex:1' }),
+          h('button', { className: 'btn', textContent: '\u00D7', style: 'padding:4px 8px', onClick: function() {
+            currentItems.splice(idx, 1);
+            _cfgFormState[path] = currentItems.slice();
+            markTouched(path);
+            renderList();
+          }})
+        );
+        row.querySelector('input').addEventListener('input', function() {
+          currentItems[idx] = this.value;
+          _cfgFormState[path] = currentItems.slice();
+          markTouched(path);
+        });
+        listDiv.appendChild(row);
+      })(i);
     }
-    var d = res.data;
-    var panel = h('div', { className: 'diff-panel' });
-    if (d.changes && d.changes.length > 0) {
-      panel.appendChild(h('div', { className: 'diff-change', style: 'margin-bottom:8px;font-weight:600', textContent: 'Changes:' }));
-      for (var c of d.changes) {
-        var line = h('div', { className: 'diff-change' });
-        line.textContent = '  ' + c.path + ': ' + JSON.stringify(c.from) + ' -> ' + JSON.stringify(c.to);
-        panel.appendChild(line);
-      }
-    }
-    if (d.added && d.added.length > 0) {
-      panel.appendChild(h('div', { className: 'diff-add', style: 'margin-top:8px;font-weight:600', textContent: 'Added:' }));
-      for (var a of d.added) {
-        var aLine = h('div', { className: 'diff-add' });
-        aLine.textContent = '  + ' + a.path + ': ' + JSON.stringify(a.value);
-        panel.appendChild(aLine);
-      }
-    }
-    if (d.removed && d.removed.length > 0) {
-      panel.appendChild(h('div', { className: 'diff-remove', style: 'margin-top:8px;font-weight:600', textContent: 'Removed:' }));
-      for (var r of d.removed) {
-        var rLine = h('div', { className: 'diff-remove' });
-        rLine.textContent = '  - ' + r.path + ': ' + JSON.stringify(r.value);
-        panel.appendChild(rLine);
-      }
-    }
-    if ((!d.changes || d.changes.length === 0) && (!d.added || d.added.length === 0) && (!d.removed || d.removed.length === 0)) {
-      panel.appendChild(h('div', { textContent: 'No changes detected.', style: 'color:var(--text-dim)' }));
-    }
-    if (d.unchanged_count != null) {
-      panel.appendChild(h('div', { style: 'margin-top:8px;color:var(--text-dim);font-size:12px', textContent: d.unchanged_count + ' fields unchanged' }));
-    }
-    diffArea.appendChild(panel);
-  } catch (e) {
-    if (e.name === 'AbortError') return;
+    var addBtn = h('button', { className: 'btn', textContent: '+ Add', style: 'margin-top:4px;font-size:12px', onClick: function() {
+      currentItems.push('');
+      _cfgFormState[path] = currentItems.slice();
+      markTouched(path);
+      renderList();
+    }});
+    listDiv.appendChild(addBtn);
   }
+  renderList();
+  container.appendChild(listDiv);
+  return container;
 }
 
-async function doSave() {
-  var editor = document.getElementById('config-editor');
+// ── Secret field component ───────────────────────────────────────
+
+function buildSecretField(path, label) {
+  var container = h('div', { className: 'form-group' });
+  container.appendChild(h('label', { className: 'form-label', textContent: label }));
+
+  var fp = _cfgFingerprints[path];
+  var hasValue = !!fp;
+  var display = h('div', { style: 'display:flex;align-items:center;gap:8px' });
+  var statusText = h('span', { style: 'color:var(--text-dim);font-family:var(--mono);font-size:13px' });
+  statusText.textContent = hasValue ? 'Configured (' + fp + ')' : 'Not set';
+
+  var inputArea = h('div', { style: 'display:none' });
+  var secretInput = h('input', { className: 'form-input', type: 'password', placeholder: 'Enter new value' });
+
+  var confirmBtn = h('button', { className: 'btn', textContent: 'Confirm', style: 'font-size:12px', onClick: function() {
+    var val = secretInput.value;
+    if (!val) return;
+    _cfgFormState[path] = val;
+    markTouched(path);
+    inputArea.style.display = 'none';
+    display.style.display = 'flex';
+    statusText.textContent = 'New value pending save';
+    statusText.style.color = 'var(--yellow)';
+  }});
+
+  var cancelBtn = h('button', { className: 'btn', textContent: 'Cancel', style: 'font-size:12px', onClick: function() {
+    clearTouched(path);
+    inputArea.style.display = 'none';
+    display.style.display = 'flex';
+    statusText.textContent = hasValue ? 'Configured (' + fp + ')' : 'Not set';
+    statusText.style.color = 'var(--text-dim)';
+    secretInput.value = '';
+  }});
+
+  inputArea.appendChild(h('div', { style: 'display:flex;gap:4px' }, secretInput, confirmBtn, cancelBtn));
+
+  var changeBtn = h('button', { className: 'btn', textContent: hasValue ? 'Change' : 'Set', style: 'font-size:12px', onClick: function() {
+    display.style.display = 'none';
+    inputArea.style.display = '';
+    secretInput.focus();
+  }});
+
+  display.appendChild(statusText);
+  display.appendChild(changeBtn);
+  container.appendChild(display);
+  container.appendChild(inputArea);
+  return container;
+}
+
+// ── Channel block (enable/disable + fields) ──────────────────────
+
+function buildChannelBlock(channelKey, label, channelsConfig, fields) {
+  var enabled = channelsConfig && channelsConfig[channelKey] != null;
+  var channelData = (channelsConfig && channelsConfig[channelKey]) || {};
+  var basePath = 'channels_config.' + channelKey;
+
+  var container = h('div', { style: 'border:1px solid var(--border);border-radius:var(--radius);padding:8px;margin-bottom:8px' });
+  var headerDiv = h('div', { style: 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px' });
+  headerDiv.appendChild(h('span', { style: 'font-weight:600;color:var(--text)', textContent: label }));
+
+  var fieldsDiv = h('div', { style: enabled ? '' : 'display:none' });
+
+  if (enabled) {
+    for (var i = 0; i < fields.length; i++) {
+      var f = fields[i];
+      var fPath = basePath + '.' + f.path;
+      if (f.type === 'text') fieldsDiv.appendChild(buildTextInput(fPath, f.label, channelData[f.path] || ''));
+      else if (f.type === 'num') fieldsDiv.appendChild(buildNumberInput(fPath, f.label, channelData[f.path], 0, 65535, 1));
+      else if (f.type === 'check') fieldsDiv.appendChild(buildCheckbox(fPath, f.label, channelData[f.path]));
+      else if (f.type === 'secret') fieldsDiv.appendChild(buildSecretField(fPath, f.label));
+      else if (f.type === 'list') fieldsDiv.appendChild(buildListInput(fPath, f.label, channelData[f.path] || []));
+    }
+  }
+
+  var toggleBtn = h('button', {
+    className: 'btn',
+    textContent: enabled ? 'Disable' : 'Enable',
+    style: 'font-size:12px',
+    onClick: function() {
+      if (enabled) {
+        _cfgFormState[basePath] = null;
+        markTouched(basePath);
+        fieldsDiv.style.display = 'none';
+        toggleBtn.textContent = 'Enable';
+        enabled = false;
+      } else {
+        clearTouched(basePath);
+        fieldsDiv.style.display = '';
+        toggleBtn.textContent = 'Disable';
+        enabled = true;
+      }
+    }
+  });
+  headerDiv.appendChild(toggleBtn);
+  container.appendChild(headerDiv);
+  container.appendChild(fieldsDiv);
+  return container;
+}
+
+// ── Paired tokens display ────────────────────────────────────────
+
+function buildPairedTokensDisplay(gw) {
+  var count = gw && gw.paired_tokens ? gw.paired_tokens.length : 0;
+  var container = h('div', { className: 'form-group' });
+  container.appendChild(h('label', { className: 'form-label', textContent: 'Paired Tokens' }));
+  var info = h('div', { style: 'display:flex;align-items:center;gap:8px' });
+  info.appendChild(h('span', { style: 'color:var(--text-dim);font-family:var(--mono);font-size:13px', textContent: count + ' token(s) configured' }));
+
+  var addBtn = h('button', { className: 'btn', textContent: 'Add Token', style: 'font-size:12px', onClick: function() {
+    var ta = h('textarea', { className: 'form-input', placeholder: 'Enter tokens, one per line.\nThis REPLACES all existing tokens.', style: 'height:80px;margin-top:8px' });
+    var confirmAdd = h('button', { className: 'btn btn-primary', textContent: 'Replace All', style: 'font-size:12px;margin-top:4px', onClick: function() {
+      var lines = ta.value.split('\n').map(function(l) { return l.trim(); }).filter(function(l) { return l.length > 0; });
+      _cfgFormState['gateway.paired_tokens'] = lines;
+      markTouched('gateway.paired_tokens');
+      showNotify(document.getElementById('config-notify'), 'info', 'Paired tokens staged for save');
+      container.removeChild(ta);
+      container.removeChild(confirmAdd);
+    }});
+    container.appendChild(ta);
+    container.appendChild(confirmAdd);
+  }});
+  info.appendChild(addBtn);
+
+  var clearBtn = h('button', { className: 'btn', textContent: 'Clear All', style: 'font-size:12px;color:var(--red)', onClick: function() {
+    if (!confirm('Remove all paired tokens? Existing clients will need to re-pair.')) return;
+    _cfgFormState['gateway.paired_tokens'] = [];
+    markTouched('gateway.paired_tokens');
+    showNotify(document.getElementById('config-notify'), 'info', 'Paired tokens will be cleared on save');
+  }});
+  if (count > 0) info.appendChild(clearBtn);
+
+  container.appendChild(info);
+  return container;
+}
+
+// ── Model routes editor ──────────────────────────────────────────
+
+function buildModelRoutesEditor(routes) {
+  var container = h('div');
+  var currentRoutes = routes.map(function(r) { return { hint: r.hint, provider: r.provider, model: r.model, api_key: r.api_key || '' }; });
+  _cfgFormState['model_routes'] = currentRoutes;
+
+  function renderRoutes() {
+    clear(container);
+    for (var i = 0; i < currentRoutes.length; i++) {
+      (function(idx) {
+        var route = currentRoutes[idx];
+        var row = h('div', { style: 'border:1px solid var(--border);border-radius:var(--radius);padding:8px;margin-bottom:8px' });
+        row.appendChild(h('div', { style: 'display:flex;gap:8px;margin-bottom:4px' },
+          buildMiniInput('Hint', route.hint, function(v) { route.hint = v; markTouched('model_routes'); }),
+          buildMiniInput('Provider', route.provider, function(v) { route.provider = v; markTouched('model_routes'); }),
+          buildMiniInput('Model', route.model, function(v) { route.model = v; markTouched('model_routes'); })
+        ));
+
+        var fp = _cfgFingerprints['model_routes[' + idx + '].api_key'];
+        var keyStatus = h('span', { style: 'color:var(--text-dim);font-size:12px', textContent: fp ? 'API Key: ' + fp : 'No API key' });
+        var keyChangeBtn = h('button', { className: 'btn', textContent: fp ? 'Change Key' : 'Set Key', style: 'font-size:11px', onClick: function() {
+          var inp = h('input', { className: 'form-input', type: 'password', placeholder: 'New API key', style: 'font-size:12px' });
+          var confirmK = h('button', { className: 'btn', textContent: 'OK', style: 'font-size:11px', onClick: function() {
+            route.api_key = inp.value;
+            _routeApiKeyChanged[idx] = true;
+            markTouched('model_routes');
+            keyStatus.textContent = 'New key pending save';
+            keyStatus.style.color = 'var(--yellow)';
+            inp.remove(); confirmK.remove();
+          }});
+          row.appendChild(h('div', { style: 'display:flex;gap:4px;margin-top:4px' }, inp, confirmK));
+        }});
+        var removeBtn = h('button', { className: 'btn', textContent: 'Remove', style: 'font-size:11px;color:var(--red)', onClick: function() {
+          currentRoutes.splice(idx, 1);
+          markTouched('model_routes');
+          renderRoutes();
+        }});
+        row.appendChild(h('div', { style: 'display:flex;align-items:center;gap:8px;margin-top:4px' }, keyStatus, keyChangeBtn, removeBtn));
+        container.appendChild(row);
+      })(i);
+    }
+    container.appendChild(h('button', { className: 'btn', textContent: '+ Add Route', style: 'font-size:12px', onClick: function() {
+      currentRoutes.push({ hint: '', provider: '', model: '', api_key: '' });
+      markTouched('model_routes');
+      renderRoutes();
+    }}));
+  }
+  renderRoutes();
+  return container;
+}
+
+function buildMiniInput(placeholder, value, onChange) {
+  var inp = h('input', { className: 'form-input', type: 'text', placeholder: placeholder, value: value || '', style: 'font-size:12px;flex:1' });
+  inp.addEventListener('input', function() { onChange(this.value); });
+  return inp;
+}
+
+// ── Save via PATCH ───────────────────────────────────────────────
+
+async function doConfigPatch() {
   var notify = document.getElementById('config-notify');
   var conflictArea = document.getElementById('conflict-area');
-  if (!editor) return;
+  var patch = buildPatchFromTouched();
+
+  if (Object.keys(patch).length === 0) {
+    showNotify(notify, 'info', 'No changes to save');
+    return;
+  }
+
+  var needsSecretHeader = patchContainsSecrets(patch);
+  if (needsSecretHeader) {
+    var secretList = [];
+    for (var p in _cfgTouched) { if (cfgIsSecretPath(p)) secretList.push(p); }
+    if (patch.model_routes) {
+      for (var i = 0; i < patch.model_routes.length; i++) {
+        if (patch.model_routes[i].api_key !== undefined) secretList.push('model_routes[' + i + '].api_key');
+      }
+    }
+    if (patch.gateway && patch.gateway.paired_tokens !== undefined) secretList.push('gateway.paired_tokens');
+    if (!confirm('You are about to write new values to:\n' + secretList.join('\n') + '\n\nContinue?')) return;
+  }
 
   var btn = document.getElementById('btn-save');
   if (btn) { btn.disabled = true; btn.textContent = 'Saving...'; }
 
   try {
+    var headers = {};
+    if (needsSecretHeader) headers['X-Allow-Secret-Write'] = 'true';
+
     var res = await api('/instances/' + encodeURIComponent(state.instance) + '/config', {
-      method: 'PUT',
-      body: { config: editor.value, etag: state.configEtag }
+      method: 'PATCH',
+      headers: headers,
+      body: { patch: patch, etag: state.configEtag }
     });
 
-    if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Save Changes'; }
 
     if (res.status === 200) {
       state.configEtag = res.data.etag;
@@ -1293,32 +1866,32 @@ async function doSave() {
       if (res.data.restart_recommended) {
         showNotify(notify, 'warn', 'Instance is running - restart recommended for changes to take effect');
       }
+      // Re-fetch to update form state
+      renderConfig(state.routeGeneration);
     } else if (res.status === 409) {
-      // Conflict
       if (conflictArea) {
         clear(conflictArea);
-        var dialog = h('div', { className: 'conflict-dialog' },
+        conflictArea.appendChild(h('div', { className: 'conflict-dialog' },
           h('h3', { textContent: 'Conflict Detected' }),
-          h('p', { textContent: 'Config was modified elsewhere since you loaded it. Your local changes have NOT been saved.' }),
-          h('p', { textContent: 'You may want to copy your changes before reloading.', style: 'font-style:italic' }),
-          h('button', { className: 'btn btn-primary', textContent: 'Reload Config', onClick: function() {
-            renderConfig(state.routeGeneration);
-          }})
-        );
-        conflictArea.appendChild(dialog);
+          h('p', { textContent: 'Config was modified elsewhere. Please refresh.' }),
+          h('button', { className: 'btn btn-primary', textContent: 'Reload Config', onClick: function() { renderConfig(state.routeGeneration); }})
+        ));
       }
     } else if (res.status === 400) {
-      var msg = (res.data && res.data.error) || 'Invalid config';
+      var msg = (res.data && res.data.error) || 'Invalid patch';
       showNotify(notify, 'error', msg);
       if (res.data && res.data.blocked_fields) {
-        showNotify(notify, 'error', msg + ' - Blocked fields: ' + res.data.blocked_fields.join(', '));
+        showNotify(notify, 'error', msg + ' - Blocked: ' + res.data.blocked_fields.join(', '));
+      }
+      if (res.data && res.data.invalid_paths) {
+        showNotify(notify, 'error', msg + ' - Invalid paths: ' + res.data.invalid_paths.join(', '));
       }
     } else {
       showNotify(notify, 'error', (res.data && res.data.error) || 'Save failed');
     }
   } catch (e) {
     if (e.name === 'AbortError') return;
-    if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Save Changes'; }
     showNotify(notify, 'error', 'Save error: ' + e.message);
   }
 }
@@ -1741,6 +2314,7 @@ async function renderTelegram(gen) {
 }
 
 // ── Flows tab ────────────────────────────────────────────────────
+var _pendingBadgeCount = 0;
 async function renderFlows(gen) {
   var content = document.getElementById('tab-content');
   clear(content);
@@ -1759,17 +2333,54 @@ async function renderFlows(gen) {
       textContent: 'History',
       onClick: function() { state.flowSubTab = 'history'; renderFlows(gen); }
     }));
+    var reviewBtn = h('button', {
+      className: 'subtab' + (state.flowSubTab === 'review' ? ' active' : ''),
+      onClick: function() { state.flowSubTab = 'review'; renderFlows(gen); }
+    });
+    reviewBtn.appendChild(document.createTextNode('Review Queue'));
+    if (_pendingBadgeCount > 0) {
+      reviewBtn.appendChild(h('span', { className: 'badge', textContent: String(_pendingBadgeCount) }));
+    }
+    subtabBar.appendChild(reviewBtn);
+    subtabBar.appendChild(h('button', {
+      className: 'subtab' + (state.flowSubTab === 'versions' ? ' active' : ''),
+      textContent: 'Versions',
+      onClick: function() { state.flowSubTab = 'versions'; renderFlows(gen); }
+    }));
+    subtabBar.appendChild(h('button', {
+      className: 'subtab' + (state.flowSubTab === 'audit' ? ' active' : ''),
+      textContent: 'Audit Log',
+      onClick: function() { state.flowSubTab = 'audit'; renderFlows(gen); }
+    }));
   }
   buildSubtabs();
   content.appendChild(subtabBar);
+
+  // Fetch pending count for badge (non-blocking)
+  if (state.instance) {
+    api('/instances/' + encodeURIComponent(state.instance) + '/flows/versions/pending').then(function(res) {
+      if (gen !== state.routeGeneration) return;
+      var count = (res.status === 200 && res.data && res.data.total) ? res.data.total : 0;
+      if (count !== _pendingBadgeCount) {
+        _pendingBadgeCount = count;
+        buildSubtabs();
+      }
+    }).catch(function() {});
+  }
 
   var body = h('div', { id: 'flows-body' });
   content.appendChild(body);
 
   if (state.flowSubTab === 'active') {
     await renderActiveFlows(gen, body);
-  } else {
+  } else if (state.flowSubTab === 'history') {
     await renderFlowHistory(gen, body);
+  } else if (state.flowSubTab === 'review') {
+    await renderReviewQueue(gen, body);
+  } else if (state.flowSubTab === 'versions') {
+    await renderFlowVersions(gen, body);
+  } else if (state.flowSubTab === 'audit') {
+    await renderFlowAudit(gen, body);
   }
 }
 
@@ -2062,6 +2673,530 @@ async function renderFlowHistory(gen, container) {
   }
 
   await loadHistory();
+}
+
+// ── Flow definition viewer helper ────────────────────────────────
+function renderFlowDefinitionCard(defJson) {
+  try {
+    var def = (typeof defJson === 'string') ? JSON.parse(defJson) : defJson;
+  } catch (e) {
+    return h('div', { className: 'notify notify-error', textContent: 'Invalid definition JSON' });
+  }
+  var card = h('div', { style: 'background:var(--bg-input);padding:12px;border-radius:var(--radius);margin:8px 0;font-size:12px' });
+
+  var flowInfo = def.flow || {};
+  card.appendChild(h('div', { style: 'margin-bottom:8px' },
+    h('strong', { textContent: flowInfo.name || 'Unnamed' }),
+    flowInfo.description ? h('span', { textContent: ' - ' + flowInfo.description, style: 'color:var(--text-dim)' }) : document.createTextNode('')
+  ));
+  if (flowInfo.start) {
+    card.appendChild(h('div', { textContent: 'Start: ' + flowInfo.start, style: 'color:var(--text-dim);margin-bottom:6px' }));
+  }
+
+  var steps = def.steps || [];
+  if (steps.length === 0) {
+    card.appendChild(h('div', { textContent: 'No steps defined.', style: 'color:var(--text-dim)' }));
+  } else {
+    for (var s of steps) {
+      var trans = (s.transitions || []).map(function(t) { return t.on + ' -> ' + t.target; }).join(', ');
+      var textPreview = (s.text || '').substring(0, 60);
+      if ((s.text || '').length > 60) textPreview += '...';
+      card.appendChild(h('div', { style: 'margin:2px 0;padding:4px;border-left:2px solid var(--border);padding-left:8px' },
+        h('span', { textContent: '[' + (s.kind || '?') + '] ', style: 'color:var(--blue);font-weight:600' }),
+        h('span', { textContent: s.id || '?' }),
+        textPreview ? h('span', { textContent: ' - "' + textPreview + '"', style: 'color:var(--text-dim)' }) : document.createTextNode(''),
+        trans ? h('div', { textContent: 'Transitions: ' + trans, style: 'color:var(--text-dim);font-size:11px;margin-top:2px' }) : document.createTextNode('')
+      ));
+    }
+  }
+  return card;
+}
+
+// ── Review Queue subtab ─────────────────────────────────────────
+async function renderReviewQueue(gen, container) {
+  clear(container);
+  container.appendChild(h('div', { className: 'loading', textContent: 'Loading pending reviews...' }));
+
+  async function loadPending() {
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/versions/pending');
+      if (gen !== state.routeGeneration) return;
+      if (res.status !== 200) {
+        clear(container);
+        container.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) }));
+        return;
+      }
+      paintPending(res.data);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      clear(container);
+      container.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function paintPending(data) {
+    clear(container);
+    var panel = h('div', { className: 'panel' });
+    panel.appendChild(h('div', { className: 'panel-title', textContent: 'Review Queue', style: 'margin-bottom:12px' }));
+
+    var versions = data.versions || [];
+    _pendingBadgeCount = versions.length;
+
+    if (versions.length === 0) {
+      panel.appendChild(h('div', { className: 'empty-state', textContent: 'No versions pending review.' }));
+      container.appendChild(panel);
+      return;
+    }
+
+    var table = h('table', { className: 'data-table' });
+    var thead = h('thead', null,
+      h('tr', null,
+        h('th', { textContent: 'Flow Name' }),
+        h('th', { textContent: 'Version' }),
+        h('th', { textContent: 'Steps' }),
+        h('th', { textContent: 'Created' }),
+        h('th', { textContent: 'Actions' })
+      )
+    );
+    table.appendChild(thead);
+
+    var tbody = h('tbody');
+    for (var i = 0; i < versions.length; i++) {
+      (function(ver) {
+        var stepCount = '-';
+        try {
+          var def = JSON.parse(ver.definition_json);
+          stepCount = (def.steps || []).length;
+        } catch (e) {}
+
+        var detailRow = null;
+        var row = h('tr', { style: 'cursor:pointer', onClick: function() {
+          if (detailRow && detailRow.parentNode) {
+            detailRow.parentNode.removeChild(detailRow);
+            detailRow = null;
+          } else {
+            detailRow = h('tr', { className: 'event-detail-row' },
+              h('td', { colSpan: 5 }, renderFlowDefinitionCard(ver.definition_json))
+            );
+            row.parentNode.insertBefore(detailRow, row.nextSibling);
+          }
+        }},
+          h('td', { textContent: ver.flow_name }),
+          h('td', { textContent: 'v' + ver.version }),
+          h('td', { textContent: String(stepCount) }),
+          h('td', { textContent: fmtTime(ver.created_at) }),
+          h('td', null,
+            h('button', {
+              className: 'btn btn-primary', textContent: 'Approve',
+              style: 'padding:3px 10px;font-size:11px;margin-right:4px',
+              onClick: function(e) {
+                e.stopPropagation();
+                doApprove(ver.flow_name, ver.version, gen);
+              }
+            }),
+            h('button', {
+              className: 'btn btn-danger', textContent: 'Reject',
+              style: 'padding:3px 10px;font-size:11px',
+              onClick: function(e) {
+                e.stopPropagation();
+                showRejectModal(ver.flow_name, ver.version, gen);
+              }
+            })
+          )
+        );
+        tbody.appendChild(row);
+      })(versions[i]);
+    }
+    table.appendChild(tbody);
+    panel.appendChild(table);
+    container.appendChild(panel);
+  }
+
+  function doApprove(flowName, version, gen) {
+    confirmDialog(
+      'Approve Flow Version?',
+      'This will approve and activate "' + flowName + '" v' + version + '. The currently active version (if any) will be deactivated.',
+      'Approve',
+      'btn-primary',
+      async function() {
+        try {
+          var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/versions/' + encodeURIComponent(flowName) + '/' + version + '/approve', { method: 'POST' });
+          if (gen !== state.routeGeneration) return;
+          if (res.status === 200) {
+            showNotify(container, 'success', 'Version approved and activated');
+            loadPending();
+          } else {
+            showNotify(container, 'error', apiErrorMsg(res));
+          }
+        } catch (e) {
+          showNotify(container, 'error', 'Error: ' + e.message);
+        }
+      }
+    );
+  }
+
+  function showRejectModal(flowName, version, gen) {
+    var modal = h('div', { className: 'modal' },
+      h('h3', { textContent: 'Reject Flow Version' }),
+      h('p', { textContent: 'Reject "' + flowName + '" v' + version + '.', style: 'font-size:13px;color:var(--text-dim);margin-bottom:12px' }),
+      h('div', { className: 'form-group' },
+        h('label', { className: 'form-label', textContent: 'Reason (optional)' }),
+        h('textarea', { className: 'form-input', id: 'reject-note-input', rows: 3, placeholder: 'Why is this being rejected?' })
+      ),
+      h('div', { className: 'modal-actions' },
+        h('button', { className: 'btn', textContent: 'Cancel', onClick: closeModal }),
+        h('button', { className: 'btn btn-danger', textContent: 'Reject', onClick: async function() {
+          var noteInput = document.getElementById('reject-note-input');
+          var note = noteInput ? noteInput.value.trim() : '';
+          closeModal();
+          try {
+            var body = {};
+            if (note) body.note = note;
+            var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/versions/' + encodeURIComponent(flowName) + '/' + version + '/reject', {
+              method: 'POST', body: body
+            });
+            if (gen !== state.routeGeneration) return;
+            if (res.status === 200) {
+              showNotify(container, 'success', 'Version rejected');
+              loadPending();
+            } else {
+              showNotify(container, 'error', apiErrorMsg(res));
+            }
+          } catch (e) {
+            showNotify(container, 'error', 'Error: ' + e.message);
+          }
+        }})
+      )
+    );
+    showModal(modal);
+  }
+
+  await loadPending();
+
+  // Auto-refresh: 10s
+  state.refreshTimer = setInterval(function() {
+    if (gen !== state.routeGeneration) return;
+    loadPending();
+  }, 10000);
+}
+
+// ── Versions subtab ─────────────────────────────────────────────
+async function renderFlowVersions(gen, container) {
+  clear(container);
+
+  var verFilterName = '';
+  var verFilterStatus = '';
+  var verFilterSource = '';
+  var verOffset = 0;
+  var verLimit = 20;
+
+  function buildVersionsFilter() {
+    var bar = h('div', { className: 'filter-bar' });
+    bar.appendChild(h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Flow Name' }),
+      h('input', { type: 'text', value: verFilterName, placeholder: 'Flow name', onInput: function(e) { verFilterName = e.target.value; } })
+    ));
+    var statusSelect = h('select');
+    var statusOpts = [
+      { value: '', label: 'All' },
+      { value: 'draft', label: 'Draft' },
+      { value: 'validated', label: 'Validated' },
+      { value: 'pending_review', label: 'Pending Review' },
+      { value: 'active', label: 'Active' },
+      { value: 'deactivated', label: 'Deactivated' },
+      { value: 'rejected', label: 'Rejected' },
+    ];
+    for (var o of statusOpts) {
+      var opt = h('option', { value: o.value, textContent: o.label });
+      if (o.value === verFilterStatus) opt.selected = true;
+      statusSelect.appendChild(opt);
+    }
+    statusSelect.addEventListener('change', function(e) { verFilterStatus = e.target.value; });
+    bar.appendChild(h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Status' }),
+      statusSelect
+    ));
+    var sourceSelect = h('select');
+    var sourceOpts = [
+      { value: '', label: 'All' },
+      { value: 'agent', label: 'Agent' },
+      { value: 'operator', label: 'Operator' },
+    ];
+    for (var o of sourceOpts) {
+      var opt = h('option', { value: o.value, textContent: o.label });
+      if (o.value === verFilterSource) opt.selected = true;
+      sourceSelect.appendChild(opt);
+    }
+    sourceSelect.addEventListener('change', function(e) { verFilterSource = e.target.value; });
+    bar.appendChild(h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Source' }),
+      sourceSelect
+    ));
+    bar.appendChild(h('button', { className: 'btn btn-primary', textContent: 'Apply', onClick: function() { verOffset = 0; loadVersions(); } }));
+    bar.appendChild(h('button', { className: 'btn', textContent: 'Clear', onClick: function() {
+      verFilterName = ''; verFilterStatus = ''; verFilterSource = '';
+      verOffset = 0; loadVersions();
+    }}));
+    return bar;
+  }
+
+  container.appendChild(buildVersionsFilter());
+  var verBody = h('div', { id: 'flow-versions-body' });
+  container.appendChild(verBody);
+
+  async function loadVersions() {
+    var body = document.getElementById('flow-versions-body');
+    if (!body) return;
+    clear(body);
+    body.appendChild(h('div', { className: 'loading', textContent: 'Loading flow versions...' }));
+
+    var params = 'limit=' + verLimit + '&offset=' + verOffset;
+    if (verFilterName) params += '&flow_name=' + encodeURIComponent(verFilterName);
+    if (verFilterStatus) params += '&status=' + encodeURIComponent(verFilterStatus);
+    if (verFilterSource) params += '&source=' + encodeURIComponent(verFilterSource);
+
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/versions?' + params);
+      if (gen !== state.routeGeneration) return;
+      if (res.status !== 200) {
+        clear(body);
+        body.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) }));
+        return;
+      }
+      paintVersions(res.data, body);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      clear(body);
+      body.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function paintVersions(data, body) {
+    clear(body);
+    var panel = h('div', { className: 'panel' });
+    panel.appendChild(h('div', { className: 'panel-title', textContent: 'Flow Versions', style: 'margin-bottom:12px' }));
+
+    var versions = data.versions || [];
+    if (versions.length === 0) {
+      panel.appendChild(h('div', { className: 'empty-state', textContent: 'No flow versions found.' }));
+      body.appendChild(panel);
+      return;
+    }
+
+    var table = h('table', { className: 'data-table' });
+    var thead = h('thead', null,
+      h('tr', null,
+        h('th', { textContent: 'Flow Name' }),
+        h('th', { textContent: 'Version' }),
+        h('th', { textContent: 'Source' }),
+        h('th', { textContent: 'Status' }),
+        h('th', { textContent: 'Created' }),
+        h('th', { textContent: 'Created By' }),
+        h('th', { textContent: 'Actions' })
+      )
+    );
+    table.appendChild(thead);
+
+    var tbody = h('tbody');
+    for (var i = 0; i < versions.length; i++) {
+      (function(ver) {
+        var canActivate = (ver.status === 'deactivated' || ver.status === 'validated' || ver.status === 'pending_review');
+        var detailRow = null;
+
+        var actionsCell = h('td');
+        if (canActivate) {
+          actionsCell.appendChild(h('button', {
+            className: 'btn btn-primary', textContent: 'Activate',
+            style: 'padding:3px 10px;font-size:11px;margin-right:4px',
+            onClick: function(e) {
+              e.stopPropagation();
+              doActivate(ver.flow_name, ver.version, gen);
+            }
+          }));
+        }
+        actionsCell.appendChild(h('button', {
+          className: 'btn', textContent: 'View',
+          style: 'padding:3px 10px;font-size:11px',
+          onClick: function(e) {
+            e.stopPropagation();
+            if (detailRow && detailRow.parentNode) {
+              detailRow.parentNode.removeChild(detailRow);
+              detailRow = null;
+            } else {
+              detailRow = h('tr', { className: 'event-detail-row' },
+                h('td', { colSpan: 7 }, renderFlowDefinitionCard(ver.definition_json))
+              );
+              row.parentNode.insertBefore(detailRow, row.nextSibling);
+            }
+          }
+        }));
+
+        var row = h('tr', null,
+          h('td', { textContent: ver.flow_name }),
+          h('td', { textContent: 'v' + ver.version }),
+          h('td', { textContent: ver.source || '-' }),
+          h('td', null, h('span', { className: 'status ' + statusClass(ver.status || 'unknown'), textContent: ver.status || '-' })),
+          h('td', { textContent: fmtTime(ver.created_at) }),
+          h('td', { textContent: ver.created_by || '-' }),
+          actionsCell
+        );
+        tbody.appendChild(row);
+      })(versions[i]);
+    }
+    table.appendChild(tbody);
+    panel.appendChild(table);
+
+    // Pagination
+    var total = data.total || 0;
+    if (total > 0) {
+      var pag = h('div', { className: 'pagination' },
+        h('span', { textContent: 'Showing ' + (verOffset + 1) + '-' + Math.min(verOffset + versions.length, total) + ' of ' + total })
+      );
+      if (verOffset > 0) {
+        pag.appendChild(h('button', { className: 'btn', textContent: 'Previous', onClick: function() { verOffset = Math.max(0, verOffset - verLimit); loadVersions(); } }));
+      }
+      if (verOffset + verLimit < total) {
+        pag.appendChild(h('button', { className: 'btn', textContent: 'Next', onClick: function() { verOffset += verLimit; loadVersions(); } }));
+      }
+      panel.appendChild(pag);
+    }
+    body.appendChild(panel);
+  }
+
+  function doActivate(flowName, version, gen) {
+    confirmDialog(
+      'Activate Flow Version?',
+      'This will activate "' + flowName + '" v' + version + '. The currently active version (if any) will be deactivated.',
+      'Activate',
+      'btn-primary',
+      async function() {
+        try {
+          var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/versions/' + encodeURIComponent(flowName) + '/' + version + '/activate', { method: 'POST' });
+          if (gen !== state.routeGeneration) return;
+          if (res.status === 200) {
+            showNotify(container, 'success', 'Version activated');
+            loadVersions();
+          } else {
+            showNotify(container, 'error', apiErrorMsg(res));
+          }
+        } catch (e) {
+          showNotify(container, 'error', 'Error: ' + e.message);
+        }
+      }
+    );
+  }
+
+  await loadVersions();
+}
+
+// ── Audit Log subtab ────────────────────────────────────────────
+async function renderFlowAudit(gen, container) {
+  clear(container);
+
+  var auditFilterName = '';
+  var auditOffset = 0;
+  var auditLimit = 20;
+
+  function buildAuditFilter() {
+    var bar = h('div', { className: 'filter-bar' });
+    bar.appendChild(h('div', { className: 'filter-field' },
+      h('label', { textContent: 'Flow Name' }),
+      h('input', { type: 'text', value: auditFilterName, placeholder: 'Flow name', onInput: function(e) { auditFilterName = e.target.value; } })
+    ));
+    bar.appendChild(h('button', { className: 'btn btn-primary', textContent: 'Apply', onClick: function() { auditOffset = 0; loadAudit(); } }));
+    bar.appendChild(h('button', { className: 'btn', textContent: 'Clear', onClick: function() {
+      auditFilterName = '';
+      auditOffset = 0; loadAudit();
+    }}));
+    return bar;
+  }
+
+  container.appendChild(buildAuditFilter());
+  var auditBody = h('div', { id: 'flow-audit-body' });
+  container.appendChild(auditBody);
+
+  async function loadAudit() {
+    var body = document.getElementById('flow-audit-body');
+    if (!body) return;
+    clear(body);
+    body.appendChild(h('div', { className: 'loading', textContent: 'Loading audit log...' }));
+
+    var params = 'limit=' + auditLimit + '&offset=' + auditOffset;
+    if (auditFilterName) params += '&flow_name=' + encodeURIComponent(auditFilterName);
+
+    try {
+      var res = await api('/instances/' + encodeURIComponent(state.instance) + '/flows/audit?' + params);
+      if (gen !== state.routeGeneration) return;
+      if (res.status !== 200) {
+        clear(body);
+        body.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) }));
+        return;
+      }
+      paintAudit(res.data, body);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      clear(body);
+      body.appendChild(h('div', { className: 'notify notify-error', textContent: 'Error: ' + e.message }));
+    }
+  }
+
+  function paintAudit(data, body) {
+    clear(body);
+    var panel = h('div', { className: 'panel' });
+    panel.appendChild(h('div', { className: 'panel-title', textContent: 'Flow Audit Log', style: 'margin-bottom:12px' }));
+
+    var entries = data.entries || [];
+    if (entries.length === 0) {
+      panel.appendChild(h('div', { className: 'empty-state', textContent: 'No audit log entries found.' }));
+      body.appendChild(panel);
+      return;
+    }
+
+    var table = h('table', { className: 'data-table' });
+    var thead = h('thead', null,
+      h('tr', null,
+        h('th', { textContent: 'Time' }),
+        h('th', { textContent: 'Flow' }),
+        h('th', { textContent: 'Version' }),
+        h('th', { textContent: 'Event' }),
+        h('th', { textContent: 'Actor' }),
+        h('th', { textContent: 'Detail' })
+      )
+    );
+    table.appendChild(thead);
+
+    var tbody = h('tbody');
+    for (var r of entries) {
+      tbody.appendChild(h('tr', null,
+        h('td', { textContent: fmtTime(r.created_at) }),
+        h('td', { textContent: r.flow_name || '-' }),
+        h('td', { textContent: r.version != null ? 'v' + r.version : '-' }),
+        h('td', { textContent: r.event || '-' }),
+        h('td', { textContent: r.actor || '-' }),
+        h('td', { textContent: r.detail || '-', style: 'max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' })
+      ));
+    }
+    table.appendChild(tbody);
+    panel.appendChild(table);
+
+    // Pagination
+    var total = data.total || 0;
+    if (total > 0) {
+      var pag = h('div', { className: 'pagination' },
+        h('span', { textContent: 'Showing ' + (auditOffset + 1) + '-' + Math.min(auditOffset + entries.length, total) + ' of ' + total })
+      );
+      if (auditOffset > 0) {
+        pag.appendChild(h('button', { className: 'btn', textContent: 'Previous', onClick: function() { auditOffset = Math.max(0, auditOffset - auditLimit); loadAudit(); } }));
+      }
+      if (auditOffset + auditLimit < total) {
+        pag.appendChild(h('button', { className: 'btn', textContent: 'Next', onClick: function() { auditOffset += auditLimit; loadAudit(); } }));
+      }
+      panel.appendChild(pag);
+    }
+    body.appendChild(panel);
+  }
+
+  await loadAudit();
 }
 
 // ── Usage tab ────────────────────────────────────────────────────
