@@ -352,6 +352,7 @@ mod tests {
         Arc::new(Mutex::new(Some(TelegramToolContext {
             chat_id: chat_id.into(),
             channel: "telegram".into(),
+            user_id: None,
         })))
     }
 

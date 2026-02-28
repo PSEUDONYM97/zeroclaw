@@ -170,6 +170,7 @@ async fn phase17_smoke_end_to_end() {
     let ctx = Arc::new(Mutex::new(Some(TelegramToolContext {
         chat_id: "user123".into(),
         channel: "telegram".into(),
+        user_id: None,
     })));
     let store = Arc::new(FlowStore::new());
     let flow_tool = zeroclaw::tools::telegram_flow::TelegramFlowTool::new(

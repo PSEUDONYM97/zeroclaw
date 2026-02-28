@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
+use crate::security::approval::ApprovalGate;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -20,11 +21,20 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    approval_gate: Option<Arc<ApprovalGate>>,
 }
 
 impl ShellTool {
-    pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self { security, runtime }
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        approval_gate: Option<Arc<ApprovalGate>>,
+    ) -> Self {
+        Self {
+            security,
+            runtime,
+            approval_gate,
+        }
     }
 }
 
@@ -61,10 +71,16 @@ impl Tool for ShellTool {
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
-        let approved = args
-            .get("approved")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+
+        // When the approval gate is active, IGNORE the LLM's `approved` arg.
+        // Only the gate can grant approval -- this is the critical security fix.
+        let approved = if self.approval_gate.is_some() {
+            false
+        } else {
+            args.get("approved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
 
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
@@ -77,11 +93,59 @@ impl Tool for ShellTool {
         match self.security.validate_command_execution(command, approved) {
             Ok(_) => {}
             Err(reason) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(reason),
-                });
+                // Determine if this failure is an approval-needed case that
+                // the gate can handle. We check risk level + autonomy + policy
+                // directly instead of string-matching the error message.
+                if let Some(ref gate) = self.approval_gate {
+                    let risk = self.security.command_risk_level(command);
+                    if gate.needs_approval(risk, &self.security) {
+                        // Route through the approval gate
+                        match gate.request_approval(command, risk).await {
+                            Ok(true) => {
+                                // Re-validate with approved=true (mandatory post-approval check).
+                                // This ensures forbidden_paths, allowlist, etc. still apply.
+                                match self.security.validate_command_execution(command, true) {
+                                    Ok(_) => {} // proceed to execution below
+                                    Err(post_reason) => {
+                                        return Ok(ToolResult {
+                                            success: false,
+                                            output: String::new(),
+                                            error: Some(post_reason),
+                                        });
+                                    }
+                                }
+                            }
+                            Ok(false) => {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some("Command denied by approver".into()),
+                                });
+                            }
+                            Err(e) => {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(format!("{e}")),
+                                });
+                            }
+                        }
+                    } else {
+                        // Not an approval-eligible failure; return original error
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(reason),
+                        });
+                    }
+                } else {
+                    // No gate -- return error as-is (current behavior)
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(reason),
+                    });
+                }
             }
         }
 
@@ -181,19 +245,19 @@ mod tests {
 
     #[test]
     fn shell_tool_name() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None);
         assert_eq!(tool.name(), "shell");
     }
 
     #[test]
     fn shell_tool_description() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None);
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn shell_tool_schema_has_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None);
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["command"].is_object());
         assert!(schema["required"]
@@ -205,7 +269,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_executes_allowed_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None);
         let result = tool
             .execute(json!({"command": "echo hello"}))
             .await
@@ -217,7 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_disallowed_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None);
         let result = tool.execute(json!({"command": "rm -rf /"})).await.unwrap();
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
@@ -226,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_readonly() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime(), None);
         let result = tool.execute(json!({"command": "ls"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
@@ -234,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_missing_command_param() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("command"));
@@ -242,14 +306,14 @@ mod tests {
 
     #[tokio::test]
     async fn shell_wrong_type_param() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None);
         let result = tool.execute(json!({"command": 123})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn shell_captures_exit_code() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime(), None);
         let result = tool
             .execute(json!({"command": "ls /nonexistent_dir_xyz"}))
             .await
@@ -295,7 +359,7 @@ mod tests {
         let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
         let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
 
-        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime(), None);
         let result = tool.execute(json!({"command": "env"})).await.unwrap();
         assert!(result.success);
         assert!(
@@ -310,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_preserves_path_and_home() {
-        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime(), None);
 
         let result = tool
             .execute(json!({"command": "echo $HOME"}))
@@ -342,7 +406,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
 
-        let tool = ShellTool::new(security.clone(), test_runtime());
+        let tool = ShellTool::new(security.clone(), test_runtime(), None);
         let denied = tool
             .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
             .await

@@ -551,6 +551,13 @@ pub const VALID_CONFIG_PATHS: &[&str] = &[
     "autonomy.max_cost_per_day_cents",
     "autonomy.require_approval_for_medium_risk",
     "autonomy.block_high_risk_commands",
+    // Approval Policy
+    "approval_policy.enabled",
+    "approval_policy.timeout_secs",
+    "approval_policy.medium_risk_approver",
+    "approval_policy.high_risk_approver",
+    "approval_policy.origin_mode",
+    "approval_policy.admin_users",
     // Runtime
     "runtime.kind",
     "runtime.docker.image",
@@ -1711,6 +1718,14 @@ mod tests {
                 max_cost_per_day_cents: 500,
                 require_approval_for_medium_risk: true,
                 block_high_risk_commands: true,
+            },
+            approval_policy: ApprovalPolicyConfig {
+                enabled: false,
+                timeout_secs: 90,
+                medium_risk_approver: "origin".into(),
+                high_risk_approver: "admin".into(),
+                origin_mode: "requester_only".into(),
+                admin_users: vec!["12345".into()],
             },
             runtime: RuntimeConfig {
                 kind: "native".into(),

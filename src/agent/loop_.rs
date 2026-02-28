@@ -262,6 +262,7 @@ pub async fn run(
         mem.clone(),
         composio_key,
         &config.browser,
+        None, // No approval gate for CLI agent
     );
 
     // ── Resolve provider ─────────────────────────────────────────
@@ -540,7 +541,7 @@ After text."#;
             &crate::config::AutonomyConfig::default(),
             std::path::Path::new("/tmp"),
         ));
-        let tools = tools::default_tools(security);
+        let tools = tools::default_tools(security, None);
         let instructions = build_tool_instructions(&tools);
 
         assert!(instructions.contains("## Tool Use Protocol"));

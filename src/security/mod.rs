@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod pairing;
 pub mod policy;
 pub mod secrets;

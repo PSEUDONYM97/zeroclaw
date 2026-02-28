@@ -33,21 +33,26 @@ use crate::channels::telegram::TelegramChannel;
 use crate::channels::telegram_types::TelegramToolContext;
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
+use crate::security::approval::ApprovalGate;
 use crate::security::SecurityPolicy;
 use std::sync::{Arc, Mutex};
 
 /// Create the default tool registry
-pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
-    default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
+pub fn default_tools(
+    security: Arc<SecurityPolicy>,
+    approval_gate: Option<Arc<ApprovalGate>>,
+) -> Vec<Box<dyn Tool>> {
+    default_tools_with_runtime(security, Arc::new(NativeRuntime::new()), approval_gate)
 }
 
 /// Create the default tool registry with explicit runtime adapter.
 pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    approval_gate: Option<Arc<ApprovalGate>>,
 ) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
+        Box::new(ShellTool::new(security.clone(), runtime, approval_gate)),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security)),
     ]
@@ -59,6 +64,7 @@ pub fn all_tools(
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
+    approval_gate: Option<Arc<ApprovalGate>>,
 ) -> Vec<Box<dyn Tool>> {
     all_tools_with_runtime(
         security,
@@ -66,6 +72,7 @@ pub fn all_tools(
         memory,
         composio_key,
         browser_config,
+        approval_gate,
     )
 }
 
@@ -76,9 +83,10 @@ pub fn all_tools_with_runtime(
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
+    approval_gate: Option<Arc<ApprovalGate>>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
+        Box::new(ShellTool::new(security.clone(), runtime, approval_gate)),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(MemoryStoreTool::new(memory.clone())),
@@ -175,7 +183,7 @@ mod tests {
     #[test]
     fn default_tools_has_three() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let tools = default_tools(security, None);
         assert_eq!(tools.len(), 3);
     }
 
@@ -196,7 +204,7 @@ mod tests {
             session_name: None,
         };
 
-        let tools = all_tools(&security, mem, None, &browser);
+        let tools = all_tools(&security, mem, None, &browser, None);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
     }
@@ -218,7 +226,7 @@ mod tests {
             session_name: None,
         };
 
-        let tools = all_tools(&security, mem, None, &browser);
+        let tools = all_tools(&security, mem, None, &browser, None);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
     }
@@ -226,7 +234,7 @@ mod tests {
     #[test]
     fn default_tools_names() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let tools = default_tools(security, None);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
@@ -236,7 +244,7 @@ mod tests {
     #[test]
     fn default_tools_all_have_descriptions() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let tools = default_tools(security, None);
         for tool in &tools {
             assert!(
                 !tool.description().is_empty(),
@@ -249,7 +257,7 @@ mod tests {
     #[test]
     fn default_tools_all_have_schemas() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let tools = default_tools(security, None);
         for tool in &tools {
             let schema = tool.parameters_schema();
             assert!(
@@ -268,7 +276,7 @@ mod tests {
     #[test]
     fn tool_spec_generation() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let tools = default_tools(security, None);
         for tool in &tools {
             let spec = tool.spec();
             assert_eq!(spec.name, tool.name());

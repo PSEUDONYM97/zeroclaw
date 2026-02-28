@@ -328,6 +328,7 @@ fn keyboard_tool_resolves_chat_id() {
     let ctx = Arc::new(Mutex::new(Some(TelegramToolContext {
         chat_id: "67890".into(),
         channel: "telegram".into(),
+        user_id: None,
     })));
 
     // Args without explicit chat_id
