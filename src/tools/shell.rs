@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::approval::ApprovalGate;
+use crate::security::policy::CommandOutcome;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -72,16 +73,6 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
 
-        // When the approval gate is active, IGNORE the LLM's `approved` arg.
-        // Only the gate can grant approval -- this is the critical security fix.
-        let approved = if self.approval_gate.is_some() {
-            false
-        } else {
-            args.get("approved")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        };
-
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
@@ -90,56 +81,61 @@ impl Tool for ShellTool {
             });
         }
 
-        match self.security.validate_command_execution(command, approved) {
-            Ok(_) => {}
-            Err(reason) => {
-                // Determine if this failure is an approval-needed case that
-                // the gate can handle. We check risk level + autonomy + policy
-                // directly instead of string-matching the error message.
-                if let Some(ref gate) = self.approval_gate {
-                    let risk = self.security.command_risk_level(command);
-                    if gate.needs_approval(risk, &self.security) {
-                        // Route through the approval gate
-                        match gate.request_approval(command, risk).await {
-                            Ok(true) => {
-                                // Re-validate with approved=true (mandatory post-approval check).
-                                // This ensures forbidden_paths, allowlist, etc. still apply.
-                                match self.security.validate_command_execution(command, true) {
-                                    Ok(_) => {} // proceed to execution below
-                                    Err(post_reason) => {
-                                        return Ok(ToolResult {
-                                            success: false,
-                                            output: String::new(),
-                                            error: Some(post_reason),
-                                        });
-                                    }
+        if self.approval_gate.is_some() {
+            // Gate-active path: use structured classification.
+            // The LLM's `approved` arg is IGNORED -- only the gate can grant approval.
+            match self.security.classify_command(command) {
+                CommandOutcome::Allowed(_) => {} // proceed to execution
+                CommandOutcome::NeedsApproval(risk) => {
+                    let gate = self.approval_gate.as_ref().unwrap();
+                    match gate.request_approval(command, risk).await {
+                        Ok(true) => {
+                            // Re-validate with approved=true (mandatory post-approval check).
+                            // This ensures allowlist, hard-block policy, etc. still apply.
+                            match self.security.validate_command_execution(command, true) {
+                                Ok(_) => {} // proceed to execution
+                                Err(post_reason) => {
+                                    return Ok(ToolResult {
+                                        success: false,
+                                        output: String::new(),
+                                        error: Some(post_reason),
+                                    });
                                 }
                             }
-                            Ok(false) => {
-                                return Ok(ToolResult {
-                                    success: false,
-                                    output: String::new(),
-                                    error: Some("Command denied by approver".into()),
-                                });
-                            }
-                            Err(e) => {
-                                return Ok(ToolResult {
-                                    success: false,
-                                    output: String::new(),
-                                    error: Some(format!("{e}")),
-                                });
-                            }
                         }
-                    } else {
-                        // Not an approval-eligible failure; return original error
-                        return Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(reason),
-                        });
+                        Ok(false) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some("Command denied by approver".into()),
+                            });
+                        }
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("{e}")),
+                            });
+                        }
                     }
-                } else {
-                    // No gate -- return error as-is (current behavior)
+                }
+                CommandOutcome::HardDeny(reason) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(reason),
+                    });
+                }
+            }
+        } else {
+            // Legacy path (no gate): use validate_command_execution with LLM's approved flag
+            let approved = args
+                .get("approved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match self.security.validate_command_execution(command, approved) {
+                Ok(_) => {}
+                Err(reason) => {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),

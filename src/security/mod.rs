@@ -5,6 +5,6 @@ pub mod secrets;
 
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
-pub use policy::{AutonomyLevel, SecurityPolicy};
+pub use policy::{AutonomyLevel, CommandOutcome, SecurityPolicy};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;

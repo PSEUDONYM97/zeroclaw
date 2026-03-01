@@ -1060,7 +1060,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 .await;
         }
 
-        // Set Telegram tool context (so tools can resolve chat_id)
+        // Set Telegram tool context (so tools can resolve chat_id).
+        // Clear on non-telegram messages to prevent stale context from leaking
+        // into tool calls triggered by other channels (e.g. CLI).
         if msg.channel == "telegram" {
             let msg_user_id = msg
                 .metadata
@@ -1073,6 +1075,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     channel: "telegram".into(),
                     user_id: msg_user_id,
                 });
+            }
+        } else {
+            // Non-telegram message: clear stale context so the approval gate
+            // fails with "No Telegram context" instead of using wrong origin.
+            if let Ok(mut guard) = telegram_context.lock() {
+                *guard = None;
             }
         }
 

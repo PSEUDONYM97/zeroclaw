@@ -961,7 +961,7 @@ impl Channel for TelegramChannel {
                                 }
 
                                 let cb_uid = cb_user_id.as_deref().unwrap_or("unknown");
-                                match registry.resolve(req_id, cb_uid, is_approve) {
+                                match registry.resolve(req_id, cb_uid, cb_username, is_approve) {
                                     Ok(msg) => {
                                         let _ = self.answer_callback_query(&cb_id, Some(&msg), false).await;
                                     }

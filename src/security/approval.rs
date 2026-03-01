@@ -47,11 +47,14 @@ impl ApprovalRegistry {
     /// Resolve a pending approval request.
     ///
     /// Checks: exists, not expired, not already resolved, caller authorized.
+    /// The caller provides both the numeric Telegram user ID and the username,
+    /// since `authorized_approver_ids` may contain either form (or `"*"`).
     /// Returns Ok(message) on success, Err(message) on failure.
     pub fn resolve(
         &self,
         id: &str,
         callback_user_id: &str,
+        callback_username: &str,
         approved: bool,
     ) -> Result<String, String> {
         let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -71,8 +74,13 @@ impl ApprovalRegistry {
             return Err("Already decided".into());
         }
 
-        // Authorization check
-        if !req.authorized_approver_ids.contains(&callback_user_id.to_string()) {
+        // Authorization check: match numeric ID, username, or wildcard "*"
+        let is_authorized = req.authorized_approver_ids.iter().any(|allowed| {
+            allowed == "*"
+                || allowed == callback_user_id
+                || allowed == callback_username
+        });
+        if !is_authorized {
             return Err("You're not authorized to approve this".into());
         }
 
@@ -338,7 +346,7 @@ mod tests {
         let (id, _rx) = registry.register(request);
         assert_eq!(id, "aabbccdd");
 
-        let result = registry.resolve("aabbccdd", "456", true);
+        let result = registry.resolve("aabbccdd", "456", "testuser", true);
         assert!(result.is_ok());
         assert!(result.unwrap().contains("Approved"));
     }
@@ -359,7 +367,7 @@ mod tests {
         };
 
         let (_id, _rx) = registry.register(request);
-        let result = registry.resolve("aabbccdd", "999", true);
+        let result = registry.resolve("aabbccdd", "999", "eve", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not authorized"));
     }
@@ -381,7 +389,7 @@ mod tests {
         };
 
         let (_id, _rx) = registry.register(request);
-        let result = registry.resolve("aabbccdd", "456", true);
+        let result = registry.resolve("aabbccdd", "456", "testuser", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expired"));
     }
@@ -404,11 +412,11 @@ mod tests {
         let (_id, _rx) = registry.register(request);
 
         // First resolve succeeds
-        let result1 = registry.resolve("aabbccdd", "456", true);
+        let result1 = registry.resolve("aabbccdd", "456", "testuser", true);
         assert!(result1.is_ok());
 
         // Second resolve: entry already removed
-        let result2 = registry.resolve("aabbccdd", "456", false);
+        let result2 = registry.resolve("aabbccdd", "456", "testuser", false);
         assert!(result2.is_err());
         assert!(result2.unwrap_err().contains("expired"));
     }
@@ -416,7 +424,7 @@ mod tests {
     #[test]
     fn registry_resolve_not_found() {
         let registry = ApprovalRegistry::new();
-        let result = registry.resolve("nonexistent", "456", true);
+        let result = registry.resolve("nonexistent", "456", "testuser", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expired"));
     }
@@ -474,16 +482,16 @@ mod tests {
         let (_id_b, _rx_b) = registry.register(req_b);
 
         // user_a cannot resolve request B
-        let result = registry.resolve("bbbbbbbb", "user_a", true);
+        let result = registry.resolve("bbbbbbbb", "user_a", "username_a", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not authorized"));
 
         // user_b can resolve request B
-        let result = registry.resolve("bbbbbbbb", "user_b", true);
+        let result = registry.resolve("bbbbbbbb", "user_b", "username_b", true);
         assert!(result.is_ok());
 
         // request A is still pending and resolvable by user_a
-        let result = registry.resolve("aaaaaaaa", "user_a", false);
+        let result = registry.resolve("aaaaaaaa", "user_a", "username_a", false);
         assert!(result.is_ok());
         assert!(result.unwrap().contains("Denied"));
     }
@@ -648,5 +656,90 @@ mod tests {
         // Not guaranteed to be different but practically always is
         // This is a smoke test, not a cryptographic requirement
         let _ = (a, b);
+    }
+
+    #[test]
+    fn resolve_matches_by_username() {
+        let registry = ApprovalRegistry::new();
+        let request = ApprovalRequest {
+            id: "uname001".into(),
+            command: "echo test".into(),
+            risk_level: CommandRiskLevel::Medium,
+            origin_chat_id: "123".into(),
+            origin_user_id: Some("456".into()),
+            // authorized by username "alice", not numeric ID
+            authorized_approver_ids: vec!["alice".into()],
+            created_at: Instant::now(),
+            expires_at: Instant::now() + std::time::Duration::from_secs(90),
+            resolved: false,
+        };
+
+        let (_id, _rx) = registry.register(request);
+        // Numeric ID doesn't match, but username does
+        let result = registry.resolve("uname001", "99999", "alice", true);
+        assert!(result.is_ok(), "Should match by username");
+    }
+
+    #[test]
+    fn resolve_matches_by_numeric_id() {
+        let registry = ApprovalRegistry::new();
+        let request = ApprovalRequest {
+            id: "numid001".into(),
+            command: "echo test".into(),
+            risk_level: CommandRiskLevel::Medium,
+            origin_chat_id: "123".into(),
+            origin_user_id: Some("456".into()),
+            authorized_approver_ids: vec!["456".into()],
+            created_at: Instant::now(),
+            expires_at: Instant::now() + std::time::Duration::from_secs(90),
+            resolved: false,
+        };
+
+        let (_id, _rx) = registry.register(request);
+        // Numeric ID matches, username doesn't
+        let result = registry.resolve("numid001", "456", "unknown_user", true);
+        assert!(result.is_ok(), "Should match by numeric ID");
+    }
+
+    #[test]
+    fn resolve_wildcard_authorizes_anyone() {
+        let registry = ApprovalRegistry::new();
+        let request = ApprovalRequest {
+            id: "wild0001".into(),
+            command: "echo test".into(),
+            risk_level: CommandRiskLevel::Medium,
+            origin_chat_id: "123".into(),
+            origin_user_id: Some("456".into()),
+            authorized_approver_ids: vec!["*".into()],
+            created_at: Instant::now(),
+            expires_at: Instant::now() + std::time::Duration::from_secs(90),
+            resolved: false,
+        };
+
+        let (_id, _rx) = registry.register(request);
+        // Any user should be authorized with wildcard
+        let result = registry.resolve("wild0001", "random_id", "random_user", true);
+        assert!(result.is_ok(), "Wildcard should authorize any user");
+    }
+
+    #[test]
+    fn resolve_neither_id_nor_username_matches() {
+        let registry = ApprovalRegistry::new();
+        let request = ApprovalRequest {
+            id: "nope0001".into(),
+            command: "echo test".into(),
+            risk_level: CommandRiskLevel::Medium,
+            origin_chat_id: "123".into(),
+            origin_user_id: Some("456".into()),
+            authorized_approver_ids: vec!["alice".into(), "789".into()],
+            created_at: Instant::now(),
+            expires_at: Instant::now() + std::time::Duration::from_secs(90),
+            resolved: false,
+        };
+
+        let (_id, _rx) = registry.register(request);
+        let result = registry.resolve("nope0001", "999", "bob", true);
+        assert!(result.is_err(), "Neither ID nor username matches");
+        assert!(result.unwrap_err().contains("not authorized"));
     }
 }
