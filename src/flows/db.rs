@@ -606,6 +606,74 @@ impl FlowDb {
         Ok(count > 0)
     }
 
+    /// List all flow versions with optional multi-column filtering + pagination.
+    /// Returns (rows, total_count). ORDER BY created_at DESC.
+    pub fn list_all_flow_versions(
+        &self,
+        limit: usize,
+        offset: usize,
+        flow_name_filter: Option<&str>,
+        status_filter: Option<&str>,
+        source_filter: Option<&str>,
+    ) -> anyhow::Result<(Vec<FlowVersionRow>, usize)> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut where_clauses = Vec::new();
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(name) = flow_name_filter {
+            where_clauses.push("flow_name = ?");
+            bind_values.push(Box::new(name.to_string()));
+        }
+        if let Some(status) = status_filter {
+            where_clauses.push("status = ?");
+            bind_values.push(Box::new(status.to_string()));
+        }
+        if let Some(source) = source_filter {
+            where_clauses.push("source = ?");
+            bind_values.push(Box::new(source.to_string()));
+        }
+
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
+
+        // Count
+        let count_sql = format!("SELECT COUNT(*) FROM flow_versions {where_sql}");
+        let total: usize = {
+            let mut stmt = guard.prepare(&count_sql)?;
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                bind_values.iter().map(|b| b.as_ref()).collect();
+            stmt.query_row(refs.as_slice(), |row| row.get(0))?
+        };
+
+        // Rows
+        let query_sql = format!(
+            "SELECT id, flow_name, version, source, status, definition_json,
+                    created_at, created_by, review_note
+             FROM flow_versions {where_sql}
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?{} OFFSET ?{}",
+            bind_values.len() + 1,
+            bind_values.len() + 2,
+        );
+        bind_values.push(Box::new(limit as i64));
+        bind_values.push(Box::new(offset as i64));
+
+        let mut stmt = guard.prepare(&query_sql)?;
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), Self::map_version_row)?;
+
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok((result, total))
+    }
+
     // ── Audit Log (Phase 17) ────────────────────────────────────
 
     /// Append an entry to the flow audit log.

@@ -1,9 +1,9 @@
 pub mod schema;
 
 pub use schema::{
-    zeroclaw_home, AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config,
-    DiscordConfig, DockerRuntimeConfig, FlowPolicyConfig, GatewayConfig, HeartbeatConfig,
-    IMessageConfig, IdentityConfig, MatrixConfig, MemoryConfig, ModelRouteConfig,
+    zeroclaw_home, ApprovalPolicyConfig, AutonomyConfig, BrowserConfig, ChannelsConfig,
+    ComposioConfig, Config, DiscordConfig, DockerRuntimeConfig, FlowPolicyConfig, GatewayConfig,
+    HeartbeatConfig, IMessageConfig, IdentityConfig, MatrixConfig, MemoryConfig, ModelRouteConfig,
     ObservabilityConfig, ReliabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig,
     TelegramConfig, TunnelConfig, WebhookConfig,
 };

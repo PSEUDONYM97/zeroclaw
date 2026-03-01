@@ -28,6 +28,9 @@ pub struct Config {
     pub autonomy: AutonomyConfig,
 
     #[serde(default)]
+    pub approval_policy: ApprovalPolicyConfig,
+
+    #[serde(default)]
     pub runtime: RuntimeConfig,
 
     #[serde(default)]
@@ -411,6 +414,68 @@ impl Default for AutonomyConfig {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+        }
+    }
+}
+
+// ── Approval Policy ──────────────────────────────────────────────
+
+/// Configuration for the Telegram approval gate.
+///
+/// When enabled, risky shell commands in supervised mode require explicit
+/// human approval via Telegram inline keyboards instead of trusting the
+/// LLM's `approved` parameter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalPolicyConfig {
+    /// Master switch. `false` = current behavior (LLM sees error).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Per-request timeout in seconds. Non-revivable after expiry.
+    #[serde(default = "default_approval_timeout")]
+    pub timeout_secs: u64,
+
+    /// Who can approve medium-risk commands: `"origin"` or `"admin"`.
+    #[serde(default = "default_origin")]
+    pub medium_risk_approver: String,
+
+    /// Who can approve high-risk commands: `"origin"` or `"admin"`.
+    #[serde(default = "default_admin")]
+    pub high_risk_approver: String,
+
+    /// Origin approval mode:
+    /// - `"requester_only"`: only the requesting user can approve
+    /// - `"any_allowed"`: any allowed_user in the origin chat can approve
+    #[serde(default = "default_requester_only")]
+    pub origin_mode: String,
+
+    /// Telegram user IDs with admin approval rights.
+    #[serde(default)]
+    pub admin_users: Vec<String>,
+}
+
+fn default_approval_timeout() -> u64 {
+    90
+}
+fn default_origin() -> String {
+    "origin".into()
+}
+fn default_admin() -> String {
+    "admin".into()
+}
+fn default_requester_only() -> String {
+    "requester_only".into()
+}
+
+impl Default for ApprovalPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: 90,
+            medium_risk_approver: "origin".into(),
+            high_risk_approver: "admin".into(),
+            origin_mode: "requester_only".into(),
+            admin_users: Vec::new(),
         }
     }
 }
@@ -912,6 +977,7 @@ impl Default for Config {
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
+            approval_policy: ApprovalPolicyConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             model_routes: Vec::new(),
@@ -1229,6 +1295,7 @@ mod tests {
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
             },
+            approval_policy: ApprovalPolicyConfig::default(),
             runtime: RuntimeConfig {
                 kind: "docker".into(),
                 ..RuntimeConfig::default()
@@ -1324,6 +1391,7 @@ default_temperature = 0.7
             default_temperature: 0.9,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
+            approval_policy: ApprovalPolicyConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             model_routes: Vec::new(),

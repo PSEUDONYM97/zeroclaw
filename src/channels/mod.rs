@@ -525,13 +525,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
     } else {
         None
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
-        &security,
-        runtime_adapter,
-        mem.clone(),
-        composio_key,
-        &config.browser,
-    );
 
     // Shared context for Telegram tools (set before each agent_turn)
     let telegram_context: Arc<std::sync::Mutex<Option<TelegramToolContext>>> =
@@ -592,7 +585,58 @@ pub async fn start_channels(config: Config) -> Result<()> {
         crate::flows::state::FlowStore::new()
     });
 
-    // Conditionally register Telegram tools
+    // ── Approval policy startup validation ─────────────────────
+    let approval_policy = &config.approval_policy;
+    if approval_policy.enabled {
+        if config.channels_config.telegram.is_none() {
+            anyhow::bail!(
+                "approval_policy.enabled=true requires a Telegram channel to be configured"
+            );
+        }
+        if approval_policy.high_risk_approver == "admin" && approval_policy.admin_users.is_empty() {
+            anyhow::bail!(
+                "approval_policy.high_risk_approver='admin' but admin_users is empty"
+            );
+        }
+        if approval_policy.medium_risk_approver == "admin" && approval_policy.admin_users.is_empty()
+        {
+            anyhow::bail!(
+                "approval_policy.medium_risk_approver='admin' but admin_users is empty"
+            );
+        }
+        if approval_policy.origin_mode != "requester_only"
+            && approval_policy.origin_mode != "any_allowed"
+        {
+            anyhow::bail!(
+                "approval_policy.origin_mode must be 'requester_only' or 'any_allowed', \
+                 got '{}'",
+                approval_policy.origin_mode
+            );
+        }
+        // Enforce admin_users are also allowed identities
+        if let Some(ref tg) = config.channels_config.telegram {
+            if !tg.allowed_users.contains(&"*".to_string()) {
+                for admin_id in &approval_policy.admin_users {
+                    if !tg.allowed_users.contains(admin_id) {
+                        anyhow::bail!(
+                            "approval_policy.admin_users contains '{}' which is not in \
+                             channels_config.telegram.allowed_users",
+                            admin_id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Build Telegram channel + approval gate ─────────────────
+    let approval_registry: Option<Arc<crate::security::approval::ApprovalRegistry>> =
+        if approval_policy.enabled {
+            Some(Arc::new(crate::security::approval::ApprovalRegistry::new()))
+        } else {
+            None
+        };
+
     let telegram_channel_arc: Option<Arc<TelegramChannel>> =
         if let Some(ref tg) = config.channels_config.telegram {
             let mut ch = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone());
@@ -603,29 +647,65 @@ pub async fn start_channels(config: Config) -> Result<()> {
             if let Some(ref db) = flow_db {
                 ch = ch.with_flow_db(db.clone());
             }
-            let arc = Arc::new(ch);
-            let tg_flow_policy = config
-                .channels_config
-                .telegram
-                .as_ref()
-                .map(|t| t.flow_policy.clone())
-                .unwrap_or_default();
-            if flows_enabled && !flow_defs.is_empty() {
-                tools_registry.extend(tools::telegram_tools_with_flows(
-                    arc.clone(),
-                    telegram_context.clone(),
-                    flow_defs.clone(),
-                    flow_store.clone(),
-                    flow_db.clone(),
-                    tg_flow_policy.clone(),
-                ));
-            } else {
-                tools_registry.extend(tools::telegram_tools(arc.clone(), telegram_context.clone()));
+            if let Some(ref reg) = approval_registry {
+                ch = ch.with_approval_registry(reg.clone());
             }
-            Some(arc)
+            Some(Arc::new(ch))
         } else {
             None
         };
+
+    // Build approval gate (if enabled and Telegram channel exists)
+    let approval_gate: Option<Arc<crate::security::approval::ApprovalGate>> =
+        if let (Some(ref reg), Some(ref tg_arc)) = (&approval_registry, &telegram_channel_arc) {
+            let allowed_users = config
+                .channels_config
+                .telegram
+                .as_ref()
+                .map(|t| t.allowed_users.clone())
+                .unwrap_or_default();
+            Some(Arc::new(crate::security::approval::ApprovalGate::new(
+                reg.clone(),
+                tg_arc.clone(),
+                telegram_context.clone(),
+                config.approval_policy.clone(),
+                allowed_users,
+            )))
+        } else {
+            None
+        };
+
+    // ── Create tools registry (with approval gate if configured) ──
+    let mut tools_registry = tools::all_tools_with_runtime(
+        &security,
+        runtime_adapter,
+        mem.clone(),
+        composio_key,
+        &config.browser,
+        approval_gate,
+    );
+
+    // Register Telegram tools
+    if let Some(ref arc) = telegram_channel_arc {
+        let tg_flow_policy = config
+            .channels_config
+            .telegram
+            .as_ref()
+            .map(|t| t.flow_policy.clone())
+            .unwrap_or_default();
+        if flows_enabled && !flow_defs.is_empty() {
+            tools_registry.extend(tools::telegram_tools_with_flows(
+                arc.clone(),
+                telegram_context.clone(),
+                flow_defs.clone(),
+                flow_store.clone(),
+                flow_db.clone(),
+                tg_flow_policy.clone(),
+            ));
+        } else {
+            tools_registry.extend(tools::telegram_tools(arc.clone(), telegram_context.clone()));
+        }
+    }
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -980,13 +1060,27 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 .await;
         }
 
-        // Set Telegram tool context (so tools can resolve chat_id)
+        // Set Telegram tool context (so tools can resolve chat_id).
+        // Clear on non-telegram messages to prevent stale context from leaking
+        // into tool calls triggered by other channels (e.g. CLI).
         if msg.channel == "telegram" {
+            let msg_user_id = msg
+                .metadata
+                .get("user_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             if let Ok(mut guard) = telegram_context.lock() {
                 *guard = Some(TelegramToolContext {
                     chat_id: msg.sender.clone(),
                     channel: "telegram".into(),
+                    user_id: msg_user_id,
                 });
+            }
+        } else {
+            // Non-telegram message: clear stale context so the approval gate
+            // fails with "No Telegram context" instead of using wrong origin.
+            if let Ok(mut guard) = telegram_context.lock() {
+                *guard = None;
             }
         }
 

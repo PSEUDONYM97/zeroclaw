@@ -24,6 +24,21 @@ pub enum CommandRiskLevel {
     High,
 }
 
+/// Structured outcome of command validation.
+///
+/// Separates hard denials (allowlist, hard-blocked risk) from cases where
+/// human approval can unlock execution. This prevents the approval gate
+/// from sending prompts for commands that will fail post-approval anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutcome {
+    /// Command passes all checks at the given risk level.
+    Allowed(CommandRiskLevel),
+    /// Command is on the allowlist but requires human approval at this risk level.
+    NeedsApproval(CommandRiskLevel),
+    /// Command is unconditionally blocked (allowlist, hard-block policy, readonly).
+    HardDeny(String),
+}
+
 /// Sliding-window action tracker for rate limiting.
 #[derive(Debug)]
 pub struct ActionTracker {
@@ -286,6 +301,42 @@ impl SecurityPolicy {
         } else {
             CommandRiskLevel::Low
         }
+    }
+
+    /// Classify a command into structured outcomes without the `approved` flag.
+    ///
+    /// This is the preferred entry point when an approval gate is active.
+    /// It separates hard denials from approval-eligible cases, preventing
+    /// the gate from prompting for commands that would fail anyway.
+    pub fn classify_command(&self, command: &str) -> CommandOutcome {
+        // 1. Allowlist check (hard deny)
+        if !self.is_command_allowed(command) {
+            return CommandOutcome::HardDeny(format!(
+                "Command not allowed by security policy: {command}"
+            ));
+        }
+
+        let risk = self.command_risk_level(command);
+
+        // 2. High risk + hard-block policy = hard deny
+        if risk == CommandRiskLevel::High && self.block_high_risk_commands {
+            return CommandOutcome::HardDeny(
+                "Command blocked: high-risk command is disallowed by policy".into(),
+            );
+        }
+
+        // 3. Supervised mode risk gates
+        if self.autonomy == AutonomyLevel::Supervised {
+            if risk == CommandRiskLevel::High {
+                return CommandOutcome::NeedsApproval(risk);
+            }
+            if risk == CommandRiskLevel::Medium && self.require_approval_for_medium_risk {
+                return CommandOutcome::NeedsApproval(risk);
+            }
+        }
+
+        // 4. Everything else is allowed
+        CommandOutcome::Allowed(risk)
     }
 
     /// Validate full command execution policy (allowlist + risk gate).

@@ -89,6 +89,8 @@ impl SpeechClient {
 pub struct TelegramToolContext {
     pub chat_id: String,
     pub channel: String,
+    /// Telegram numeric user ID of the message sender (for approval routing)
+    pub user_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -158,9 +160,21 @@ mod tests {
         let ctx = TelegramToolContext {
             chat_id: "12345".into(),
             channel: "telegram".into(),
+            user_id: Some("67890".into()),
         };
         let cloned = ctx.clone();
         assert_eq!(cloned.chat_id, "12345");
         assert_eq!(cloned.channel, "telegram");
+        assert_eq!(cloned.user_id.as_deref(), Some("67890"));
+    }
+
+    #[test]
+    fn tool_context_without_user_id() {
+        let ctx = TelegramToolContext {
+            chat_id: "12345".into(),
+            channel: "telegram".into(),
+            user_id: None,
+        };
+        assert!(ctx.user_id.is_none());
     }
 }

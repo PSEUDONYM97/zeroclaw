@@ -63,6 +63,7 @@ pub struct TelegramChannel {
     observer: Option<Arc<dyn Observer>>,
     seen_update_ids: Arc<Mutex<SeenUpdates>>,
     flow_db: Option<Arc<crate::flows::db::FlowDb>>,
+    approval_registry: Option<Arc<crate::security::approval::ApprovalRegistry>>,
 }
 
 impl TelegramChannel {
@@ -76,7 +77,17 @@ impl TelegramChannel {
             observer: None,
             seen_update_ids: Arc::new(Mutex::new(SeenUpdates::new())),
             flow_db: None,
+            approval_registry: None,
         }
+    }
+
+    /// Attach an approval registry for handling approval callbacks.
+    pub fn with_approval_registry(
+        mut self,
+        registry: Arc<crate::security::approval::ApprovalRegistry>,
+    ) -> Self {
+        self.approval_registry = Some(registry);
+        self
     }
 
     /// Attach an STT endpoint for voice transcription
@@ -936,10 +947,36 @@ impl Channel for TelegramChannel {
                             continue;
                         }
 
+                        // ── Approval gate callbacks (before generic handler) ──
+                        let callback_data_raw = cb["data"].as_str().unwrap_or_default();
+                        if let Some(ref registry) = self.approval_registry {
+                            if callback_data_raw.starts_with("apv:") || callback_data_raw.starts_with("dny:") {
+                                let is_approve = callback_data_raw.starts_with("apv:");
+                                let req_id = &callback_data_raw[4..];
+
+                                // Validate ID format: must be 8 hex chars
+                                if req_id.len() != 8 || !req_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                                    let _ = self.answer_callback_query(&cb_id, Some("Invalid request"), false).await;
+                                    continue;
+                                }
+
+                                let cb_uid = cb_user_id.as_deref().unwrap_or("unknown");
+                                match registry.resolve(req_id, cb_uid, cb_username, is_approve) {
+                                    Ok(msg) => {
+                                        let _ = self.answer_callback_query(&cb_id, Some(&msg), false).await;
+                                    }
+                                    Err(msg) => {
+                                        let _ = self.answer_callback_query(&cb_id, Some(&msg), true).await;
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+
                         // Answer callback to dismiss the loading spinner
                         let _ = self.answer_callback_query(&cb_id, None, false).await;
 
-                        let callback_data = cb["data"].as_str().unwrap_or_default().to_string();
+                        let callback_data = callback_data_raw.to_string();
                         let chat_id = cb["message"]["chat"]["id"]
                             .as_i64()
                             .map(|id| id.to_string())
@@ -964,6 +1001,9 @@ impl Channel for TelegramChannel {
                         metadata.insert("msg_type".into(), serde_json::json!("callback_query"));
                         metadata.insert("callback_query_id".into(), serde_json::json!(cb_id));
                         metadata.insert("original_message_id".into(), serde_json::json!(original_msg_id));
+                        if let Some(ref uid) = cb_user_id {
+                            metadata.insert("user_id".into(), serde_json::json!(uid));
+                        }
 
                         let msg = ChannelMessage {
                             id: Uuid::new_v4().to_string(),
@@ -1044,6 +1084,9 @@ impl Channel for TelegramChannel {
                                 "option_ids".into(),
                                 serde_json::json!(&option_ids),
                             );
+                            if let Some(ref uid) = pa_user_id {
+                                metadata.insert("user_id".into(), serde_json::json!(uid));
+                            }
 
                             let msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
@@ -1139,6 +1182,9 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                         metadata.insert("msg_type".into(), serde_json::json!("voice"));
                         metadata.insert("file_id".into(), serde_json::json!(file_id));
                         metadata.insert("duration".into(), serde_json::json!(duration));
+                        if let Some(ref uid) = user_id_str {
+                            metadata.insert("user_id".into(), serde_json::json!(uid));
+                        }
 
                         // File-size guard
                         if file_size > MAX_VOICE_BYTES {
@@ -1500,6 +1546,9 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                         let mut metadata = HashMap::new();
                         metadata.insert("msg_type".into(), serde_json::json!("photo"));
                         metadata.insert("file_id".into(), serde_json::json!(file_id));
+                        if let Some(ref uid) = user_id_str {
+                            metadata.insert("user_id".into(), serde_json::json!(uid));
+                        }
 
                         let caption = message
                             .get("caption")
@@ -1555,6 +1604,9 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                         metadata.insert("file_id".into(), serde_json::json!(file_id));
                         metadata.insert("file_name".into(), serde_json::json!(file_name));
                         metadata.insert("mime_type".into(), serde_json::json!(mime_type));
+                        if let Some(ref uid) = user_id_str {
+                            metadata.insert("user_id".into(), serde_json::json!(uid));
+                        }
 
                         let content = format!("[Document: {file_name}]");
 
@@ -1607,6 +1659,9 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
 
                     let mut metadata = HashMap::new();
                     metadata.insert("msg_type".into(), serde_json::json!("text"));
+                    if let Some(ref uid) = user_id_str {
+                        metadata.insert("user_id".into(), serde_json::json!(uid));
+                    }
 
                     let msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
