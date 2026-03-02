@@ -195,6 +195,55 @@ a:hover { text-decoration: underline; }
 .notify-warn { background: rgba(229,192,123,0.1); border: 1px solid var(--yellow); color: var(--yellow); }
 .notify-info { background: rgba(97,175,239,0.1); border: 1px solid var(--blue); color: var(--blue); }
 
+/* Setup wizard */
+.wizard-container { max-width: 640px; margin: 0 auto; }
+.wizard-steps { display: flex; align-items: center; justify-content: center; gap: 0; margin-bottom: 28px; }
+.wizard-step-num {
+  width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 600; border: 2px solid var(--border); color: var(--text-dim); background: var(--bg);
+  flex-shrink: 0;
+}
+.wizard-step-num.active { border-color: var(--blue); color: var(--blue); background: rgba(97,175,239,0.1); }
+.wizard-step-num.done { border-color: var(--green); color: var(--green); background: rgba(61,214,140,0.1); }
+.wizard-step-sep { width: 40px; height: 2px; background: var(--border); flex-shrink: 0; }
+.wizard-step-sep.done { background: var(--green); }
+.wizard-panel { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; }
+.wizard-title { font-size: 18px; font-weight: 700; margin-bottom: 4px; }
+.wizard-subtitle { font-size: 13px; color: var(--text-dim); margin-bottom: 20px; }
+.wizard-footer { display: flex; justify-content: space-between; margin-top: 20px; gap: 8px; }
+.wizard-footer .btn { min-width: 80px; }
+.slider-row { margin-bottom: 16px; }
+.slider-row label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+.slider-labels { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+.slider-row input[type=range] {
+  -webkit-appearance: none; width: 100%; height: 6px; border-radius: 3px;
+  background: var(--border); outline: none; cursor: pointer;
+}
+.slider-row input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%;
+  background: var(--blue); border: 2px solid var(--bg-card); cursor: pointer;
+}
+.slider-row input[type=range]::-moz-range-thumb {
+  width: 18px; height: 18px; border-radius: 50%;
+  background: var(--blue); border: 2px solid var(--bg-card); cursor: pointer;
+}
+.preset-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
+.preset-btn {
+  padding: 5px 12px; font-size: 12px; border-radius: 14px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text-dim); cursor: pointer; transition: all 0.15s;
+  font-family: var(--font);
+}
+.preset-btn:hover { border-color: var(--blue); color: var(--text); }
+.preset-btn.active { border-color: var(--blue); color: var(--blue); background: rgba(97,175,239,0.1); }
+.wizard-preview {
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 12px; font-size: 13px; color: var(--text-dim); line-height: 1.5; margin-top: 12px;
+  font-style: italic; min-height: 60px;
+}
+.wizard-summary { display: grid; grid-template-columns: 120px 1fr; gap: 6px 12px; font-size: 13px; }
+.wizard-summary dt { color: var(--text-dim); font-weight: 600; }
+.wizard-summary dd { color: var(--text); margin: 0; }
+
 /* Diff panel */
 .diff-panel {
   background: var(--bg);
@@ -545,6 +594,544 @@ async function api(path, opts) {
   return { status: resp.status, data: data, headers: resp.headers };
 }
 
+// ── Setup Wizard ────────────────────────────────────────────────
+var _wizardState = { step: 1, basics: {}, channels: {}, personality: {}, preset: 'Balanced' };
+
+var WIZARD_PRESETS = {
+  Professional: { warmth:4, verbosity:5, formality:8, playfulness:1, creativity:3 },
+  Friendly:     { warmth:8, verbosity:6, formality:3, playfulness:6, creativity:5 },
+  Direct:       { warmth:3, verbosity:2, formality:5, playfulness:2, creativity:3 },
+  Playful:      { warmth:8, verbosity:7, formality:2, playfulness:9, creativity:8 },
+  Technical:    { warmth:3, verbosity:8, formality:6, playfulness:1, creativity:4 },
+  Balanced:     { warmth:5, verbosity:5, formality:5, playfulness:5, creativity:5 },
+};
+
+var WIZARD_SLIDER_DEFS = [
+  { key: 'warmth',      label: 'Warmth',      left: 'Reserved',  right: 'Warm' },
+  { key: 'verbosity',   label: 'Verbosity',   left: 'Terse',     right: 'Elaborate' },
+  { key: 'formality',   label: 'Formality',   left: 'Casual',    right: 'Formal' },
+  { key: 'playfulness', label: 'Playfulness', left: 'Serious',   right: 'Playful' },
+  { key: 'creativity',  label: 'Creativity',  left: 'Literal',   right: 'Creative' },
+];
+
+var WIZARD_PROVIDER_MODELS = {
+  anthropic: ['claude-sonnet-4-6', 'claude-opus-4-6', 'claude-haiku-4-5-20251001'],
+  openai: ['gpt-4o', 'gpt-4o-mini'],
+  openrouter: ['anthropic/claude-sonnet-4-6', 'openai/gpt-4o', 'google/gemini-2.0-flash', 'meta-llama/llama-3.3-70b-instruct'],
+  ollama: ['llama3', 'mistral', 'codellama'],
+  groq: ['llama-3.3-70b-versatile', 'mixtral-8x7b-32768'],
+  together: ['meta-llama/Llama-3.3-70B-Instruct-Turbo', 'mistralai/Mixtral-8x7B-Instruct-v0.1'],
+};
+
+function slidersToPreview(p) {
+  var parts = [];
+  if (p.warmth <= 3) parts.push('Be direct and professional, keeping emotional distance.');
+  else if (p.warmth <= 6) parts.push('Be approachable and genuine, with a balanced tone.');
+  else parts.push('Be warm, friendly, and personable.');
+
+  if (p.verbosity <= 3) parts.push('Keep responses brief and to the point.');
+  else if (p.verbosity <= 6) parts.push('Aim for clarity and appropriate depth.');
+  else parts.push('Be thorough and elaborate in explanations.');
+
+  if (p.formality <= 3) parts.push('Use a casual, conversational tone.');
+  else if (p.formality <= 6) parts.push('Balance professionalism with a natural voice.');
+  else parts.push('Maintain a polished, professional tone.');
+
+  if (p.playfulness <= 3) parts.push('Stay focused and straightforward.');
+  else if (p.playfulness <= 6) parts.push('Bring light humor and wit when appropriate.');
+  else parts.push('Be playful, witty, and don\'t shy from jokes.');
+
+  if (p.creativity <= 3) parts.push('Stick to proven approaches and concrete facts.');
+  else if (p.creativity <= 6) parts.push('Use occasional relevant emojis (1-2 max).');
+  else parts.push('Think creatively and offer imaginative suggestions.');
+
+  return parts.join(' ');
+}
+
+function buildWizardSteps(currentStep) {
+  var bar = h('div', { className: 'wizard-steps' });
+  var labels = ['Basics', 'Channels', 'Personality', 'Finish'];
+  for (var i = 0; i < labels.length; i++) {
+    if (i > 0) {
+      var sep = h('div', { className: 'wizard-step-sep' + (i < currentStep ? ' done' : '') });
+      bar.appendChild(sep);
+    }
+    var cls = 'wizard-step-num';
+    if (i + 1 < currentStep) cls += ' done';
+    else if (i + 1 === currentStep) cls += ' active';
+    bar.appendChild(h('div', { className: cls, textContent: String(i + 1) }));
+  }
+  return bar;
+}
+
+function buildSliderRow(def, value, onChange) {
+  var row = h('div', { className: 'slider-row' });
+  row.appendChild(h('label', { textContent: def.label + ': ' + value }));
+  var input = h('input', { type: 'range', min: '0', max: '10', value: String(value) });
+  input.addEventListener('input', function() {
+    var val = parseInt(this.value, 10);
+    row.querySelector('label').textContent = def.label + ': ' + val;
+    onChange(val);
+  });
+  row.appendChild(input);
+  row.appendChild(h('div', { className: 'slider-labels' },
+    h('span', { textContent: def.left }),
+    h('span', { textContent: def.right })
+  ));
+  return row;
+}
+
+function paintWizardBasics(panel, gen) {
+  panel.appendChild(h('div', { className: 'wizard-title', textContent: 'Basic Setup' }));
+  panel.appendChild(h('div', { className: 'wizard-subtitle', textContent: 'Configure your agent\'s identity and AI provider.' }));
+
+  var b = _wizardState.basics;
+
+  // Agent name
+  var nameIn = h('input', { className: 'input', type: 'text', placeholder: 'e.g. Atlas', value: b.agent_name || state.instance || '' });
+  nameIn.addEventListener('input', function() { _wizardState.basics.agent_name = this.value; });
+  panel.appendChild(h('div', { style: 'margin-bottom:12px' },
+    h('label', { style: 'display:block;font-size:13px;font-weight:600;margin-bottom:4px', textContent: 'Agent Display Name' }),
+    nameIn
+  ));
+
+  // User name
+  var userIn = h('input', { className: 'input', type: 'text', placeholder: 'Your name', value: b.user_name || '' });
+  userIn.addEventListener('input', function() { _wizardState.basics.user_name = this.value; });
+  panel.appendChild(h('div', { style: 'margin-bottom:12px' },
+    h('label', { style: 'display:block;font-size:13px;font-weight:600;margin-bottom:4px', textContent: 'How should I address you?' }),
+    userIn
+  ));
+
+  // Timezone
+  var tzIn = h('input', { className: 'input', type: 'text', placeholder: 'e.g. America/Chicago', value: b.timezone || '' });
+  tzIn.addEventListener('input', function() { _wizardState.basics.timezone = this.value; });
+  panel.appendChild(h('div', { style: 'margin-bottom:12px' },
+    h('label', { style: 'display:block;font-size:13px;font-weight:600;margin-bottom:4px', textContent: 'Timezone' }),
+    tzIn
+  ));
+
+  // Provider
+  var provOpts = ['openrouter', 'anthropic', 'openai', 'ollama', 'groq', 'together'];
+  var provSelect = h('select', { className: 'input' });
+  provOpts.forEach(function(p) {
+    var opt = h('option', { value: p, textContent: p });
+    if ((b.provider || 'openrouter') === p) opt.selected = true;
+    provSelect.appendChild(opt);
+  });
+  if (!b.provider) _wizardState.basics.provider = 'openrouter';
+
+  // Model
+  var modelIn = h('input', { className: 'input', type: 'text', placeholder: 'Model name', value: b.model || '' });
+  modelIn.addEventListener('input', function() { _wizardState.basics.model = this.value; });
+
+  // Populate model suggestions
+  var modelList = h('datalist', { id: 'wizard-model-suggestions' });
+  function updateModelSuggestions(prov) {
+    while (modelList.firstChild) modelList.removeChild(modelList.firstChild);
+    var models = WIZARD_PROVIDER_MODELS[prov] || [];
+    models.forEach(function(m) { modelList.appendChild(h('option', { value: m })); });
+    if (models.length > 0 && !_wizardState.basics.model) {
+      modelIn.value = models[0];
+      _wizardState.basics.model = models[0];
+    }
+  }
+  updateModelSuggestions(b.provider || 'openrouter');
+  modelIn.setAttribute('list', 'wizard-model-suggestions');
+
+  provSelect.addEventListener('change', function() {
+    _wizardState.basics.provider = this.value;
+    _wizardState.basics.model = '';
+    modelIn.value = '';
+    updateModelSuggestions(this.value);
+  });
+
+  panel.appendChild(h('div', { style: 'margin-bottom:12px' },
+    h('label', { style: 'display:block;font-size:13px;font-weight:600;margin-bottom:4px', textContent: 'AI Provider' }),
+    provSelect
+  ));
+  panel.appendChild(modelList);
+  panel.appendChild(h('div', { style: 'margin-bottom:12px' },
+    h('label', { style: 'display:block;font-size:13px;font-weight:600;margin-bottom:4px', textContent: 'Model' }),
+    modelIn
+  ));
+
+  // API Key
+  var keyIn = h('input', { className: 'input', type: 'password', placeholder: 'Optional -- set later in Config', value: b.api_key || '' });
+  keyIn.addEventListener('input', function() { _wizardState.basics.api_key = this.value; });
+  panel.appendChild(h('div', { style: 'margin-bottom:12px' },
+    h('label', { style: 'display:block;font-size:13px;font-weight:600;margin-bottom:4px', textContent: 'API Key' }),
+    keyIn
+  ));
+}
+
+function paintWizardChannels(panel, gen) {
+  panel.appendChild(h('div', { className: 'wizard-title', textContent: 'Channels' }));
+  panel.appendChild(h('div', { className: 'wizard-subtitle', textContent: 'Enable messaging channels. You can add more later in Config.' }));
+
+  var ch = _wizardState.channels;
+
+  // Telegram
+  var tgFields = h('div', { style: ch.telegram_enabled ? '' : 'display:none' });
+  var tgTokenIn = h('input', { className: 'input', type: 'password', placeholder: 'Bot token from @BotFather', value: ch.telegram_bot_token || '' });
+  tgTokenIn.addEventListener('input', function() { _wizardState.channels.telegram_bot_token = this.value; });
+  var tgUsersIn = h('input', { className: 'input', type: 'text', placeholder: 'Comma-separated usernames', value: ch.telegram_allowed_users || '' });
+  tgUsersIn.addEventListener('input', function() { _wizardState.channels.telegram_allowed_users = this.value; });
+  tgFields.appendChild(h('div', { style: 'margin-bottom:8px;margin-top:8px' },
+    h('label', { style: 'display:block;font-size:12px;font-weight:600;margin-bottom:4px', textContent: 'Bot Token' }), tgTokenIn));
+  tgFields.appendChild(h('div', { style: 'margin-bottom:8px' },
+    h('label', { style: 'display:block;font-size:12px;font-weight:600;margin-bottom:4px', textContent: 'Allowed Users' }), tgUsersIn));
+
+  var tgToggle = h('button', {
+    className: 'btn' + (ch.telegram_enabled ? ' btn-primary' : ''),
+    textContent: ch.telegram_enabled ? 'Telegram: ON' : 'Telegram: OFF',
+    onClick: function() {
+      ch.telegram_enabled = !ch.telegram_enabled;
+      tgToggle.className = 'btn' + (ch.telegram_enabled ? ' btn-primary' : '');
+      tgToggle.textContent = ch.telegram_enabled ? 'Telegram: ON' : 'Telegram: OFF';
+      tgFields.style.display = ch.telegram_enabled ? '' : 'none';
+    }
+  });
+  panel.appendChild(h('div', { style: 'border:1px solid var(--border);border-radius:var(--radius);padding:12px;margin-bottom:12px' },
+    tgToggle, tgFields));
+
+  // Discord
+  var dcFields = h('div', { style: ch.discord_enabled ? '' : 'display:none' });
+  var dcTokenIn = h('input', { className: 'input', type: 'password', placeholder: 'Discord bot token', value: ch.discord_bot_token || '' });
+  dcTokenIn.addEventListener('input', function() { _wizardState.channels.discord_bot_token = this.value; });
+  var dcGuildIn = h('input', { className: 'input', type: 'text', placeholder: 'Guild ID', value: ch.discord_guild_id || '' });
+  dcGuildIn.addEventListener('input', function() { _wizardState.channels.discord_guild_id = this.value; });
+  dcFields.appendChild(h('div', { style: 'margin-bottom:8px;margin-top:8px' },
+    h('label', { style: 'display:block;font-size:12px;font-weight:600;margin-bottom:4px', textContent: 'Bot Token' }), dcTokenIn));
+  dcFields.appendChild(h('div', { style: 'margin-bottom:8px' },
+    h('label', { style: 'display:block;font-size:12px;font-weight:600;margin-bottom:4px', textContent: 'Guild ID' }), dcGuildIn));
+
+  var dcToggle = h('button', {
+    className: 'btn' + (ch.discord_enabled ? ' btn-primary' : ''),
+    textContent: ch.discord_enabled ? 'Discord: ON' : 'Discord: OFF',
+    onClick: function() {
+      ch.discord_enabled = !ch.discord_enabled;
+      dcToggle.className = 'btn' + (ch.discord_enabled ? ' btn-primary' : '');
+      dcToggle.textContent = ch.discord_enabled ? 'Discord: ON' : 'Discord: OFF';
+      dcFields.style.display = ch.discord_enabled ? '' : 'none';
+    }
+  });
+  panel.appendChild(h('div', { style: 'border:1px solid var(--border);border-radius:var(--radius);padding:12px;margin-bottom:12px' },
+    dcToggle, dcFields));
+}
+
+function paintWizardPersonality(panel, gen) {
+  panel.appendChild(h('div', { className: 'wizard-title', textContent: 'Personality' }));
+  panel.appendChild(h('div', { className: 'wizard-subtitle', textContent: 'Shape how your agent communicates.' }));
+
+  var p = _wizardState.personality;
+  if (p.warmth === undefined) {
+    var def = WIZARD_PRESETS.Balanced;
+    p.warmth = def.warmth; p.verbosity = def.verbosity; p.formality = def.formality;
+    p.playfulness = def.playfulness; p.creativity = def.creativity;
+  }
+
+  // Preset bar
+  var presetBar = h('div', { className: 'preset-bar' });
+  var presetBtns = {};
+  var presetNames = ['Professional', 'Friendly', 'Direct', 'Playful', 'Technical', 'Balanced'];
+
+  function updatePresetHighlight() {
+    for (var name in presetBtns) {
+      presetBtns[name].className = 'preset-btn' + (_wizardState.preset === name ? ' active' : '');
+    }
+  }
+
+  presetNames.forEach(function(name) {
+    var btn = h('button', {
+      className: 'preset-btn' + (_wizardState.preset === name ? ' active' : ''),
+      textContent: name,
+      onClick: function() {
+        var vals = WIZARD_PRESETS[name];
+        _wizardState.preset = name;
+        p.warmth = vals.warmth; p.verbosity = vals.verbosity; p.formality = vals.formality;
+        p.playfulness = vals.playfulness; p.creativity = vals.creativity;
+        updatePresetHighlight();
+        rebuildSliders();
+        updatePreview();
+      }
+    });
+    presetBtns[name] = btn;
+    presetBar.appendChild(btn);
+  });
+
+  // Randomize button
+  presetBar.appendChild(h('button', {
+    className: 'preset-btn',
+    textContent: 'Randomize',
+    onClick: function() {
+      _wizardState.preset = 'Custom';
+      WIZARD_SLIDER_DEFS.forEach(function(def) { p[def.key] = 3 + Math.floor(Math.random() * 6); });
+      updatePresetHighlight();
+      rebuildSliders();
+      updatePreview();
+    }
+  }));
+  panel.appendChild(presetBar);
+
+  // Sliders container
+  var slidersDiv = h('div');
+
+  function rebuildSliders() {
+    while (slidersDiv.firstChild) slidersDiv.removeChild(slidersDiv.firstChild);
+    WIZARD_SLIDER_DEFS.forEach(function(def) {
+      slidersDiv.appendChild(buildSliderRow(def, p[def.key], function(val) {
+        p[def.key] = val;
+        _wizardState.preset = 'Custom';
+        updatePresetHighlight();
+        updatePreview();
+      }));
+    });
+  }
+  rebuildSliders();
+  panel.appendChild(slidersDiv);
+
+  // Preview
+  var previewDiv = h('div', { className: 'wizard-preview', textContent: slidersToPreview(p) });
+  function updatePreview() {
+    previewDiv.textContent = slidersToPreview(p);
+  }
+  panel.appendChild(h('div', { style: 'margin-top:8px' },
+    h('label', { style: 'font-size:12px;font-weight:600;color:var(--text-dim)', textContent: 'Communication Style Preview' }),
+    previewDiv
+  ));
+}
+
+function paintWizardFinish(panel, gen) {
+  panel.appendChild(h('div', { className: 'wizard-title', textContent: 'Review & Finish' }));
+  panel.appendChild(h('div', { className: 'wizard-subtitle', textContent: 'Summary of your agent setup.' }));
+
+  var b = _wizardState.basics;
+  var ch = _wizardState.channels;
+  var dl = h('dl', { className: 'wizard-summary' });
+
+  dl.appendChild(h('dt', { textContent: 'Agent Name' }));
+  dl.appendChild(h('dd', { textContent: b.agent_name || state.instance || '-' }));
+  dl.appendChild(h('dt', { textContent: 'Your Name' }));
+  dl.appendChild(h('dd', { textContent: b.user_name || '-' }));
+  dl.appendChild(h('dt', { textContent: 'Provider' }));
+  dl.appendChild(h('dd', { textContent: (b.provider || '-') + ' / ' + (b.model || '-') }));
+  dl.appendChild(h('dt', { textContent: 'Channels' }));
+  var chList = [];
+  if (ch.telegram_enabled) chList.push('Telegram');
+  if (ch.discord_enabled) chList.push('Discord');
+  dl.appendChild(h('dd', { textContent: chList.length > 0 ? chList.join(', ') : 'None' }));
+  dl.appendChild(h('dt', { textContent: 'Personality' }));
+  dl.appendChild(h('dd', { textContent: _wizardState.preset || 'Custom' }));
+
+  panel.appendChild(dl);
+
+  // Preview of comm style
+  panel.appendChild(h('div', { style: 'margin-top:16px' },
+    h('label', { style: 'font-size:12px;font-weight:600;color:var(--text-dim)', textContent: 'Communication Style' }),
+    h('div', { className: 'wizard-preview', textContent: slidersToPreview(_wizardState.personality) })
+  ));
+}
+
+function paintWizardStep(container, gen) {
+  var panel = container.querySelector('.wizard-panel');
+  if (!panel) return;
+  while (panel.firstChild) panel.removeChild(panel.firstChild);
+
+  // Replace step indicator
+  var oldSteps = container.querySelector('.wizard-steps');
+  if (oldSteps) oldSteps.replaceWith(buildWizardSteps(_wizardState.step));
+
+  switch (_wizardState.step) {
+    case 1: paintWizardBasics(panel, gen); break;
+    case 2: paintWizardChannels(panel, gen); break;
+    case 3: paintWizardPersonality(panel, gen); break;
+    case 4: paintWizardFinish(panel, gen); break;
+  }
+
+  // Footer
+  var footer = container.querySelector('.wizard-footer');
+  if (footer) {
+    while (footer.firstChild) footer.removeChild(footer.firstChild);
+
+    if (_wizardState.step > 1) {
+      footer.appendChild(h('button', { className: 'btn', textContent: 'Back', onClick: function() {
+        _wizardState.step--;
+        paintWizardStep(container, gen);
+      }}));
+    } else {
+      footer.appendChild(h('span'));
+    }
+
+    var rightBtns = h('div', { style: 'display:flex;gap:8px' });
+    if (_wizardState.step < 4) {
+      rightBtns.appendChild(h('button', { className: 'btn', textContent: 'Skip', onClick: function() {
+        _wizardState.step++;
+        paintWizardStep(container, gen);
+      }}));
+      rightBtns.appendChild(h('button', { className: 'btn btn-primary', textContent: 'Next', onClick: function() {
+        _wizardState.step++;
+        paintWizardStep(container, gen);
+      }}));
+    } else {
+      rightBtns.appendChild(h('button', { className: 'btn btn-primary', textContent: 'Set Up Agent', onClick: function() {
+        wizardSubmit(container, gen);
+      }}));
+    }
+    footer.appendChild(rightBtns);
+  }
+}
+
+async function wizardSubmit(container, gen) {
+  var footer = container.querySelector('.wizard-footer');
+  if (footer) { while (footer.firstChild) footer.removeChild(footer.firstChild); footer.appendChild(h('div', { className: 'loading', textContent: 'Setting up...' })); }
+
+  var notifyArea = container.querySelector('.wizard-notify') || container;
+
+  try {
+    // Step 0: fetch fresh config ETag
+    var configRes = await api('/instances/' + encodeURIComponent(state.instance) + '/config');
+    if (configRes.status !== 200) {
+      showNotify(notifyArea, 'error', 'Failed to load config: ' + apiErrorMsg(configRes));
+      paintWizardStep(container, gen);
+      return;
+    }
+    state.configEtag = configRes.data && configRes.data.etag;
+
+    // Step 1: build minimal patch from wizard state
+    var patch = {};
+    var b = _wizardState.basics;
+    var ch = _wizardState.channels;
+
+    // agent_name is passed to scaffold POST, not config PATCH (identity has no 'name' field)
+    if (b.provider) setNestedPath(patch, 'default_provider', b.provider);
+    if (b.model) setNestedPath(patch, 'default_model', b.model);
+    if (b.api_key) setNestedPath(patch, 'api_key', b.api_key);
+
+    // Channels
+    if (ch.telegram_enabled) {
+      if (ch.telegram_bot_token) setNestedPath(patch, 'channels_config.telegram.bot_token', ch.telegram_bot_token);
+      if (ch.telegram_allowed_users) {
+        var users = ch.telegram_allowed_users.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+        if (users.length > 0) setNestedPath(patch, 'channels_config.telegram.allowed_users', users);
+      }
+    }
+    if (ch.discord_enabled) {
+      if (ch.discord_bot_token) setNestedPath(patch, 'channels_config.discord.bot_token', ch.discord_bot_token);
+      if (ch.discord_guild_id) setNestedPath(patch, 'channels_config.discord.guild_id', ch.discord_guild_id);
+    }
+
+    // Only PATCH if there's something to send
+    if (Object.keys(patch).length > 0) {
+      // Step 2: detect secrets
+      var hasSecrets = false;
+      var secretPaths = ['api_key', 'channels_config.telegram.bot_token', 'channels_config.discord.bot_token'];
+      secretPaths.forEach(function(sp) {
+        var parts = sp.split('.'); var cur = patch;
+        for (var i = 0; i < parts.length; i++) { if (cur == null) return; cur = cur[parts[i]]; }
+        if (cur !== undefined) hasSecrets = true;
+      });
+
+      var patchHeaders = {};
+      if (hasSecrets) patchHeaders['X-Allow-Secret-Write'] = 'true';
+
+      // Step 3: PATCH
+      var patchRes = await api('/instances/' + encodeURIComponent(state.instance) + '/config', {
+        method: 'PATCH',
+        headers: patchHeaders,
+        body: { patch: patch, etag: state.configEtag }
+      });
+
+      if (patchRes.status === 409) {
+        // Show conflict error with retry button that re-fetches ETag and retries
+        var conflictDiv = h('div', { className: 'notify notify-error', style: 'display:flex;align-items:center;justify-content:space-between' },
+          h('span', { textContent: 'Config was modified elsewhere.' }),
+          h('button', { className: 'btn', style: 'margin-left:12px;white-space:nowrap', textContent: 'Retry', onClick: function() {
+            wizardSubmit(container, gen);
+          }})
+        );
+        var existingNotify = notifyArea.querySelector('.notify');
+        if (existingNotify) existingNotify.remove();
+        notifyArea.insertBefore(conflictDiv, notifyArea.firstChild);
+        paintWizardStep(container, gen);
+        return;
+      }
+      if (patchRes.status !== 200) {
+        var errMsg = 'Config update failed';
+        if (patchRes.data) {
+          if (patchRes.data.blocked_fields) errMsg += ': blocked fields ' + JSON.stringify(patchRes.data.blocked_fields);
+          else if (patchRes.data.invalid_paths) errMsg += ': invalid paths ' + JSON.stringify(patchRes.data.invalid_paths);
+          else if (patchRes.data.error) errMsg += ': ' + patchRes.data.error;
+        }
+        showNotify(notifyArea, 'error', errMsg);
+        paintWizardStep(container, gen);
+        return;
+      }
+      // Update ETag from response
+      if (patchRes.data && patchRes.data.etag) state.configEtag = patchRes.data.etag;
+    }
+
+    // Step 4: scaffold workspace
+    var p = _wizardState.personality;
+    var scaffoldBody = {
+      agent_name: b.agent_name || state.instance || '',
+      user_name: b.user_name || '',
+      timezone: b.timezone || '',
+    };
+    // Always send personality (defaults to Balanced if user skipped)
+    scaffoldBody.personality = {
+      warmth: p.warmth !== undefined ? p.warmth : 5,
+      verbosity: p.verbosity !== undefined ? p.verbosity : 5,
+      formality: p.formality !== undefined ? p.formality : 5,
+      playfulness: p.playfulness !== undefined ? p.playfulness : 5,
+      creativity: p.creativity !== undefined ? p.creativity : 5,
+    };
+
+    var scaffRes = await api('/instances/' + encodeURIComponent(state.instance) + '/scaffold', {
+      method: 'POST',
+      body: scaffoldBody
+    });
+
+    if (scaffRes.status !== 200) {
+      showNotify(notifyArea, 'error', 'Scaffold failed: ' + apiErrorMsg(scaffRes));
+      paintWizardStep(container, gen);
+      return;
+    }
+
+    // Success! Redirect to overview
+    location.hash = '#/instance/' + encodeURIComponent(state.instance) + '/overview';
+    setTimeout(function() {
+      var content = document.getElementById('tab-content');
+      if (content) showNotify(content, 'success', 'Agent set up successfully! Created ' + (scaffRes.data && scaffRes.data.files_created || 0) + ' workspace files.');
+    }, 200);
+
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    showNotify(notifyArea, 'error', 'Error: ' + e.message);
+    paintWizardStep(container, gen);
+  }
+}
+
+function renderSetupWizard(gen) {
+  var content = document.getElementById('tab-content');
+  clear(content);
+
+  // Reset wizard state for fresh run
+  _wizardState = { step: 1, basics: { agent_name: state.instance || '' }, channels: {}, personality: {}, preset: 'Balanced' };
+  // Apply Balanced defaults
+  var def = WIZARD_PRESETS.Balanced;
+  _wizardState.personality = { warmth: def.warmth, verbosity: def.verbosity, formality: def.formality, playfulness: def.playfulness, creativity: def.creativity };
+
+  var wiz = h('div', { className: 'wizard-container' });
+  wiz.appendChild(buildWizardSteps(1));
+  wiz.appendChild(h('div', { className: 'wizard-notify' }));
+  wiz.appendChild(h('div', { className: 'wizard-panel' }));
+  wiz.appendChild(h('div', { className: 'wizard-footer' }));
+
+  content.appendChild(wiz);
+  paintWizardStep(wiz, gen);
+}
+
 // ── Router ───────────────────────────────────────────────────────
 function route() {
   if (state.refreshTimer) { clearInterval(state.refreshTimer); state.refreshTimer = null; }
@@ -751,11 +1338,7 @@ async function doCreateInstance() {
     var res = await api('/instances', { method: 'POST', body: body });
     if (res.status === 201) {
       closeModal();
-      route(); // refresh dashboard
-      setTimeout(function() {
-        var notify = document.getElementById('dashboard-notify');
-        if (notify) showNotify(notify, 'success', 'Instance "' + name + '" created on port ' + (res.data && res.data.port));
-      }, 100);
+      location.hash = '#/instance/' + encodeURIComponent(name) + '/setup';
     } else {
       if (errorDiv) { clear(errorDiv); errorDiv.appendChild(h('div', { className: 'notify notify-error', textContent: apiErrorMsg(res) })); }
       if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Create'; }
@@ -943,6 +1526,7 @@ function renderInstance(gen) {
   else if (state.tab === 'telegram') renderTelegram(gen);
   else if (state.tab === 'flows') renderFlows(gen);
   else if (state.tab === 'usage') renderUsage(gen);
+  else if (state.tab === 'setup') renderSetupWizard(gen);
 }
 
 // ── Overview tab ─────────────────────────────────────────────────
@@ -996,6 +1580,17 @@ function paintOverview(data) {
   if (isArchived) {
     content.appendChild(h('div', { className: 'notify notify-warn', style: 'margin-bottom:16px',
       textContent: 'This instance is archived. Unarchive it to start or modify it.' }));
+  }
+
+  // Setup banner (not scaffolded yet)
+  if (data.scaffolded === false && !isArchived) {
+    var setupBanner = h('div', { className: 'notify notify-info', style: 'margin-bottom:16px;display:flex;align-items:center;justify-content:space-between' },
+      h('span', { textContent: 'No personality configured. Run the setup wizard to personalize your agent.' }),
+      h('button', { className: 'btn btn-primary', style: 'margin-left:12px;white-space:nowrap', textContent: 'Run Setup Wizard', onClick: function() {
+        location.hash = '#/instance/' + encodeURIComponent(inst.name) + '/setup';
+      }})
+    );
+    content.appendChild(setupBanner);
   }
 
   // Instance info panel

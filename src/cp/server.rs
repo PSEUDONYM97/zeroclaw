@@ -157,6 +157,11 @@ pub fn build_router(state: CpState) -> Router {
             "/messages/:id/acknowledge",
             post(messaging::handle_acknowledge_message),
         )
+        // Setup wizard: workspace scaffold
+        .route(
+            "/instances/:name/scaffold",
+            post(handle_scaffold),
+        )
         // Phase 16: Flow admin endpoints
         .route(
             "/instances/:name/flows/active",
@@ -1512,6 +1517,14 @@ async fn handle_details(
             serde_json::json!({ "kind": "unknown", "docker_image": null })
         };
 
+        // Determine whether workspace has been scaffolded (SOUL.md exists)
+        let ws_path = instance
+            .workspace_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| lifecycle::instance_dir_from(&instance).join("workspace"));
+        let scaffolded = ws_path.join("SOUL.md").exists();
+
         let mut response = serde_json::json!({
             "instance": {
                 "id": instance.id,
@@ -1528,6 +1541,7 @@ async fn handle_details(
             "channels": channels,
             "model": model,
             "runtime": runtime,
+            "scaffolded": scaffolded,
         });
 
         // Remove null config_error for cleaner output
@@ -1542,6 +1556,129 @@ async fn handle_details(
         }
 
         ok_json(response)
+    })
+    .await;
+
+    match result {
+        Ok(resp) => resp,
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Task join error: {e}"),
+        ),
+    }
+}
+
+// ── Scaffold endpoint ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ScaffoldBody {
+    agent_name: Option<String>,
+    user_name: Option<String>,
+    timezone: Option<String>,
+    personality: Option<PersonalitySliders>,
+}
+
+#[derive(Deserialize)]
+struct PersonalitySliders {
+    warmth: Option<u8>,
+    verbosity: Option<u8>,
+    formality: Option<u8>,
+    playfulness: Option<u8>,
+    creativity: Option<u8>,
+}
+
+async fn handle_scaffold(
+    State(state): State<CpState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<ScaffoldBody>,
+) -> impl IntoResponse {
+    let db_path = state.db_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> ApiResponse {
+        let registry = match open_registry(&db_path) {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let instance = match registry.get_instance_by_name(&name) {
+            Ok(Some(inst)) => inst,
+            Ok(None) => {
+                return err_json(
+                    StatusCode::NOT_FOUND,
+                    &format!("No instance named '{name}'"),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Failed to query instance: {e:#}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to query instance",
+                );
+            }
+        };
+
+        // Resolve workspace dir: registry field -> fallback to instance_dir/workspace
+        let ws_path = instance
+            .workspace_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| lifecycle::instance_dir_from(&instance).join("workspace"));
+
+        // Truncate and trim string fields to 64 chars (char-safe for UTF-8)
+        let truncate = |s: Option<String>| -> String {
+            s.map(|v| {
+                let trimmed = v.trim();
+                if trimmed.chars().count() > 64 {
+                    trimmed.chars().take(64).collect::<String>()
+                } else {
+                    trimmed.to_string()
+                }
+            })
+            .unwrap_or_default()
+        };
+
+        let agent_name = truncate(body.agent_name);
+        let user_name = truncate(body.user_name);
+        let timezone = truncate(body.timezone);
+
+        // Clamp slider values to 0..=10, default to Balanced (5)
+        let p = body.personality.unwrap_or(PersonalitySliders {
+            warmth: None,
+            verbosity: None,
+            formality: None,
+            playfulness: None,
+            creativity: None,
+        });
+        let warmth = p.warmth.unwrap_or(5).min(10);
+        let verbosity = p.verbosity.unwrap_or(5).min(10);
+        let formality = p.formality.unwrap_or(5).min(10);
+        let playfulness = p.playfulness.unwrap_or(5).min(10);
+        let creativity = p.creativity.unwrap_or(5).min(10);
+
+        let comm_style = crate::onboard::personality_sliders_to_comm_style(
+            warmth, verbosity, formality, playfulness, creativity,
+        );
+
+        let ctx = crate::onboard::ProjectContext {
+            user_name,
+            timezone,
+            agent_name,
+            communication_style: comm_style,
+        };
+
+        match crate::onboard::scaffold_workspace_cp(&ws_path, &ctx) {
+            Ok((created, skipped)) => ok_json(serde_json::json!({
+                "files_created": created,
+                "files_skipped": skipped,
+                "workspace_dir": ws_path.display().to_string(),
+            })),
+            Err(e) => {
+                tracing::error!("Scaffold failed: {e:#}");
+                err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Scaffold failed: {e}"),
+                )
+            }
+        }
     })
     .await;
 
